@@ -1,0 +1,92 @@
+{
+  "id": "library-fetcher",
+  "name": "Library Fetcher",
+  "description": "Search a configured library website, download the target book, and reuse a local cache when available.",
+  "uiHints": {
+    "playbooksDir": {
+      "label": "Playbooks Dir",
+      "placeholder": "/absolute/path/to/playbooks",
+      "help": "Directory containing one playbook JSON per supported library site."
+    },
+    "defaultSiteId": {
+      "label": "Default Site ID",
+      "placeholder": "zlib",
+      "help": "Default site playbook id. The plugin will load <playbooksDir>/<siteId>.json."
+    },
+    "defaultPlaybookPath": {
+      "label": "Default Playbook Path",
+      "placeholder": "/absolute/path/to/playbook.json",
+      "help": "Optional explicit playbook path if you only maintain one site."
+    },
+    "defaultLibraryRoot": {
+      "label": "Library Root",
+      "placeholder": "/absolute/path/to/local-library",
+      "help": "Local cache directory where downloaded books are stored."
+    },
+    "browserProfilePath": {
+      "label": "Browser Profile Path",
+      "placeholder": "/absolute/path/to/browser-profile",
+      "help": "Optional persistent browser profile to preserve login state for the library site."
+    },
+    "agentBrowserSessionConfigPath": {
+      "label": "Session Config Path",
+      "placeholder": "/absolute/path/to/agent-browser-session.json",
+      "help": "Optional JSON file containing sessionName/profilePath overrides for the persistent agent-browser session."
+    },
+    "llmFallbackCommand": {
+      "label": "LLM Repair Command",
+      "placeholder": "/absolute/path/to/repair-agent",
+      "help": "Optional external command that receives step failure context as JSON on stdin and returns repair instructions as JSON."
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "playbooksDir": {
+        "type": "string",
+        "description": "Directory containing one playbook JSON per supported site."
+      },
+      "defaultSiteId": {
+        "type": "string",
+        "description": "Default site id resolved against playbooksDir."
+      },
+      "defaultPlaybookPath": {
+        "type": "string",
+        "description": "Optional explicit default playbook path."
+      },
+      "defaultLibraryRoot": {
+        "type": "string",
+        "description": "Default local library cache directory."
+      },
+      "browserProfilePath": {
+        "type": "string",
+        "description": "Optional browser profile path used for authenticated sessions."
+      },
+      "agentBrowserSessionConfigPath": {
+        "type": "string",
+        "description": "Optional JSON file used to resolve the persistent agent-browser session and profile."
+      },
+      "downloadTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "description": "Download timeout in milliseconds."
+      },
+      "agentBrowserPath": {
+        "type": "string",
+        "description": "Optional absolute path to the agent-browser executable."
+      },
+      "llmFallbackCommand": {
+        "type": "string",
+        "description": "Optional external command used for LLM-based playbook repair."
+      },
+      "llmFallbackArgs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Optional arguments passed to the LLM repair command."
+      }
+    }
+  }
+}

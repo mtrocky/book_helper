@@ -1,0 +1,60 @@
+{
+  "id": "example-library",
+  "name": "Example Library",
+  "notes": [
+    "This is a minimal playbook for a search page, result list, detail page, and download link."
+  ],
+  "allowedDomains": [
+    "library.example.com"
+  ],
+  "llmFallback": {
+    "enabled": true,
+    "goal": "Repair a failed book search or download step on this site.",
+    "notes": [
+      "Pick the result whose title and author best match the requested book.",
+      "If the download selector fails, return a better downloadSelector or a small list of agent-browser commands."
+    ]
+  },
+  "steps": [
+    {
+      "type": "open",
+      "name": "open-search",
+      "url": "https://library.example.com/search?q={{queryEncoded}}"
+    },
+    {
+      "type": "wait",
+      "name": "wait-results",
+      "selector": ".search-results .book-card"
+    },
+    {
+      "type": "extract-results",
+      "name": "extract-results",
+      "itemSelector": ".search-results .book-card",
+      "titleSelector": ".book-title",
+      "authorSelector": ".book-author",
+      "detailLinkSelector": "a.book-title"
+    },
+    {
+      "type": "open-result",
+      "name": "open-best-result"
+    },
+    {
+      "type": "wait",
+      "name": "wait-detail",
+      "selector": "a.download-link"
+    },
+    {
+      "type": "extract-detail",
+      "name": "extract-detail",
+      "titleSelector": "h1.book-title",
+      "authorSelector": ".book-meta .author",
+      "formatSelector": ".book-meta .format",
+      "downloadSelector": "a.download-link"
+    },
+    {
+      "type": "download",
+      "name": "download-book",
+      "selector": "a.download-link"
+    }
+  ]
+}
