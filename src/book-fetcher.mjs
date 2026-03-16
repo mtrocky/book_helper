@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 import { access, copyFile, mkdir, readdir, rename, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { executeAgentBrowserPlaybook } from "./agent-browser-playbook.mjs";
+import {
+  executeAgentBrowserPlaybook,
+  scoreSearchResult,
+  searchAgentBrowserPlaybook,
+} from "./agent-browser-playbook.mjs";
 import { openCacheStore } from "./cache-store.mjs";
 import { debug } from "./debug.mjs";
 import {
@@ -131,6 +135,136 @@ export async function resetLibraryCache(rawParams, rawPluginConfig) {
   };
 }
 
+export async function lookupCachedBook(rawParams, rawPluginConfig) {
+  const startedAt = Date.now();
+  const params = validateParams(rawParams);
+  const pluginConfig = parsePluginConfig(rawPluginConfig);
+  const libraryRoot = path.resolve(
+    params.libraryRoot ?? pluginConfig.defaultLibraryRoot ?? path.join(process.cwd(), "library"),
+  );
+
+  await mkdir(libraryRoot, { recursive: true });
+  const cacheStore = await openCacheStore({ libraryRoot });
+  try {
+    const cacheHit = await cacheStore.findCacheHit({
+      query: params.query,
+      titleHint: params.titleHint,
+      authorHint: params.authorHint,
+    });
+    if (!cacheHit) {
+      return {
+        found: false,
+        backend: "cache",
+        libraryRoot,
+        elapsedSeconds: roundElapsedSeconds(startedAt),
+      };
+    }
+
+    return {
+      found: true,
+      backend: "cache",
+      title: cacheHit.title,
+      author: cacheHit.author,
+      filePath: cacheHit.filePath,
+      libraryRoot,
+      sourceUrl: sanitizeExternalUrl(cacheHit.sourceUrl),
+      downloadUrl: cacheHit.downloadUrl,
+      playbookId: cacheHit.playbookId ?? "",
+      elapsedSeconds: roundElapsedSeconds(startedAt),
+    };
+  } finally {
+    cacheStore.close();
+  }
+}
+
+export async function searchBooks(rawParams, rawPluginConfig, signal) {
+  const startedAt = Date.now();
+  const params = validateParams(rawParams);
+  const pluginConfig = parsePluginConfig(rawPluginConfig);
+  const { playbook, playbookPath } = await resolvePlaybook({
+    siteId: params.siteId,
+    playbookPath: params.playbookPath,
+    pluginConfig,
+  });
+  if (!playbook || !playbookPath) {
+    throw new Error("siteId or playbookPath is required for remote search.");
+  }
+
+  const downloadTimeoutMs =
+    params.timeoutMs ?? pluginConfig.downloadTimeoutMs ?? DEFAULT_DOWNLOAD_TIMEOUT_MS;
+  const tempRoot = path.join(os.tmpdir(), `openclaw-library-search-${randomUUID()}`);
+  await mkdir(tempRoot, { recursive: true });
+
+  try {
+    const result = await searchAgentBrowserPlaybook({
+      params,
+      pluginConfig,
+      playbook,
+      tempRoot,
+      downloadTimeoutMs,
+      signal,
+    });
+    const results = (result.results ?? [])
+      .map((entry, index) => formatSearchResult(entry, {
+        params,
+        playbookId: playbook.id,
+        playbookPath,
+        resultIndex: index + 1,
+      }))
+      .sort((left, right) => right.score - left.score);
+
+    return {
+      found: results.length > 0,
+      backend: "agent-browser-search",
+      query: params.query,
+      titleHint: params.titleHint,
+      authorHint: params.authorHint,
+      playbookId: playbook.id,
+      playbookPath,
+      results,
+      currentUrl: result.currentUrl,
+      currentTitle: result.currentTitle,
+      llmFallbackUsed: result.llmFallbackUsed,
+      elapsedSeconds: roundElapsedSeconds(startedAt),
+    };
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+}
+
+export async function downloadBookToLibrary(rawParams, rawPluginConfig, signal) {
+  const params =
+    rawParams && typeof rawParams === "object" && !Array.isArray(rawParams) ? rawParams : {};
+  const resolved = resolveSelectionTokenParams(params.selectionToken);
+  const hasSelectionToken = Boolean(params.selectionToken);
+
+  if (!hasSelectionToken) {
+    const query = typeof params.query === "string" ? params.query.trim() : "";
+    if (!query) {
+      throw new Error("library_book_download requires selectionToken or query.");
+    }
+  }
+
+  const requestParams = hasSelectionToken
+    ? {
+        libraryRoot: params.libraryRoot,
+        timeoutMs: params.timeoutMs,
+        keepSessionOnError: params.keepSessionOnError,
+        forceRefresh: Boolean(params.forceRefresh),
+        ...resolved,
+      }
+    : params;
+
+  return fetchBookToLibrary(
+    {
+      ...requestParams,
+      cacheOnly: false,
+    },
+    rawPluginConfig,
+    signal,
+  );
+}
+
 export async function fetchBookToLibrary(rawParams, rawPluginConfig, signal) {
   const startedAt = Date.now();
   const params = validateParams(rawParams);
@@ -186,7 +320,7 @@ export async function fetchBookToLibrary(rawParams, rawPluginConfig, signal) {
           author: cacheHit.author,
           filePath: cacheHit.filePath,
           libraryRoot,
-          sourceUrl: cacheHit.sourceUrl,
+          sourceUrl: sanitizeExternalUrl(cacheHit.sourceUrl),
           downloadUrl: cacheHit.downloadUrl,
           playbookId: cacheHit.playbookId ?? "",
           elapsedSeconds: roundElapsedSeconds(startedAt),
@@ -268,7 +402,7 @@ export async function fetchBookToLibrary(rawParams, rawPluginConfig, signal) {
         author: download.author,
         filePath: finalPath,
         libraryRoot,
-        sourceUrl: download.sourceUrl,
+        sourceUrl: sanitizeExternalUrl(download.sourceUrl),
         downloadUrl: download.downloadUrl,
         playbookId: playbook.id,
         llmFallbackUsed: download.llmFallbackUsed,
@@ -293,10 +427,12 @@ function validateParams(rawParams) {
   if (!query) {
     throw new Error("query is required.");
   }
+  const explicitTitleHint =
+    typeof params.titleHint === "string" ? params.titleHint.trim() : "";
 
   return {
     query,
-    titleHint: typeof params.titleHint === "string" ? params.titleHint.trim() : "",
+    titleHint: explicitTitleHint || query,
     authorHint: typeof params.authorHint === "string" ? params.authorHint.trim() : "",
     siteId: typeof params.siteId === "string" ? params.siteId.trim() : undefined,
     playbookPath: typeof params.playbookPath === "string" ? params.playbookPath : undefined,
@@ -308,6 +444,7 @@ function validateParams(rawParams) {
     keepSessionOnError: Boolean(params.keepSessionOnError),
     resultIndex:
       Number.isInteger(params.resultIndex) && params.resultIndex > 0 ? params.resultIndex : undefined,
+    selectionToken: typeof params.selectionToken === "string" ? params.selectionToken.trim() : "",
   };
 }
 
@@ -375,6 +512,68 @@ async function exists(targetPath) {
 
 function roundElapsedSeconds(startedAt) {
   return Math.round(((Date.now() - startedAt) / 1000) * 100) / 100;
+}
+
+function formatSearchResult(entry, { params, playbookId, playbookPath, resultIndex }) {
+  const score = scoreSearchResult(entry, params);
+  return {
+    title: entry.title,
+    author: entry.author,
+    publisher: entry.publisher ?? "",
+    format: entry.format ?? "",
+    resultIndex,
+    score,
+    selectionToken: encodeSelectionToken({
+      query: params.query,
+      titleHint: params.titleHint,
+      authorHint: params.authorHint,
+      playbookId,
+      playbookPath,
+      resultIndex,
+      title: entry.title,
+      author: entry.author ?? "",
+      publisher: entry.publisher ?? "",
+    }),
+  };
+}
+
+function encodeSelectionToken(payload) {
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+}
+
+function resolveSelectionTokenParams(selectionToken) {
+  if (!selectionToken) {
+    return {};
+  }
+
+  try {
+    const decoded = JSON.parse(Buffer.from(selectionToken, "base64url").toString("utf8"));
+    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+      return {};
+    }
+
+    return {
+      query: typeof decoded.query === "string" ? decoded.query : undefined,
+      titleHint: typeof decoded.titleHint === "string" ? decoded.titleHint : undefined,
+      authorHint: typeof decoded.authorHint === "string" ? decoded.authorHint : undefined,
+      playbookPath: typeof decoded.playbookPath === "string" ? decoded.playbookPath : undefined,
+      siteId: typeof decoded.playbookId === "string" ? decoded.playbookId : undefined,
+      resultIndex:
+        Number.isInteger(decoded.resultIndex) && decoded.resultIndex > 0
+          ? decoded.resultIndex
+          : undefined,
+    };
+  } catch {
+    throw new Error("Invalid selectionToken.");
+  }
+}
+
+function sanitizeExternalUrl(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw || raw.startsWith("@")) {
+    return "";
+  }
+  return raw;
 }
 
 function chooseReplacementPath({ existingEntry, download }) {

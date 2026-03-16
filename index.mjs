@@ -1,7 +1,10 @@
 import {
   auditLibraryCache,
   DEFAULT_TOOL_NAME,
+  downloadBookToLibrary,
+  lookupCachedBook,
   resetLibraryCache,
+  searchBooks,
   TOOL_GROUP,
   describeStatus,
   fetchBookToLibrary,
@@ -10,6 +13,9 @@ import {
 } from "./src/book-fetcher.mjs";
 
 const PLUGIN_ID = "library-fetcher";
+const CACHE_LOOKUP_TOOL_NAME = "library_cache_lookup";
+const SEARCH_TOOL_NAME = "library_book_search";
+const DOWNLOAD_TOOL_NAME = "library_book_download";
 
 function cloneObject(value) {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -154,20 +160,173 @@ const libraryFetcherPlugin = {
     });
 
     api.registerTool({
-      name: DEFAULT_TOOL_NAME,
-      label: "Library Book Fetch",
-      description:
-        "Search a configured library website for a book, download it into a local cache, and reuse the cached file on later requests.",
+      name: CACHE_LOOKUP_TOOL_NAME,
+      label: "Library Cache Lookup",
+      description: "Look up a book in the local SQLite cache only. Does not access the remote site.",
       parameters: {
         type: "object",
         properties: {
           query: {
             type: "string",
-            description: "Keyword query used to search the library site and the local cache.",
+            description: "Keyword query used to search the local cache.",
           },
           titleHint: {
             type: "string",
-            description: "Optional exact or near-exact title hint for better cache/result matching.",
+            description: "Optional exact title override. When omitted, the tool uses query as the title hint.",
+          },
+          authorHint: {
+            type: "string",
+            description: "Optional author hint for better cache matching.",
+          },
+          libraryRoot: {
+            type: "string",
+            description: "Absolute path to the local book cache directory. Falls back to plugin config when omitted.",
+          },
+        },
+        required: ["query"],
+      },
+      execute: async (_toolCallId, params) => {
+        const result = await lookupCachedBook(params, api.pluginConfig);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      },
+    });
+
+    api.registerTool({
+      name: SEARCH_TOOL_NAME,
+      label: "Library Book Search",
+      description: "Search the remote library site and return candidate results without downloading. Results include stable selectionToken values instead of transient browser refs.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Keyword query used to search the remote library site.",
+          },
+          titleHint: {
+            type: "string",
+            description: "Optional exact title override. When omitted, the tool uses query as the title hint.",
+          },
+          authorHint: {
+            type: "string",
+            description: "Optional author hint for better result ranking.",
+          },
+          siteId: {
+            type: "string",
+            description: "Site playbook id resolved against playbooksDir. Falls back to plugin config when omitted.",
+          },
+          playbookPath: {
+            type: "string",
+            description: "Absolute path to a site playbook JSON. Overrides siteId when provided.",
+          },
+          timeoutMs: {
+            type: "integer",
+            minimum: 1000,
+            description: "Optional search timeout override in milliseconds.",
+          },
+        },
+        required: ["query"],
+      },
+      execute: async (_toolCallId, params, signal) => {
+        const result = await searchBooks(params, api.pluginConfig, signal);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      },
+    });
+
+    api.registerTool({
+      name: DOWNLOAD_TOOL_NAME,
+      label: "Library Book Download",
+      description:
+        "Download a book from the remote library site and write it into the local cache. By default it reuses a cache hit first; pass selectionToken from library_book_search whenever possible, and use forceRefresh only when you explicitly want a fresh remote run.",
+      parameters: {
+        type: "object",
+        properties: {
+          selectionToken: {
+            type: "string",
+            description: "Stable token returned by library_book_search. When provided, it becomes the only selection input and query/titleHint/authorHint/siteId/playbookPath/resultIndex are ignored.",
+          },
+          query: {
+            type: "string",
+            description: "Fallback search phrase used only when selectionToken is omitted.",
+          },
+          titleHint: {
+            type: "string",
+            description: "Fallback exact title override used only when selectionToken is omitted.",
+          },
+          authorHint: {
+            type: "string",
+            description: "Fallback author hint used only when selectionToken is omitted.",
+          },
+          siteId: {
+            type: "string",
+            description: "Fallback site playbook id used only when selectionToken is omitted.",
+          },
+          playbookPath: {
+            type: "string",
+            description: "Fallback playbook path used only when selectionToken is omitted.",
+          },
+          libraryRoot: {
+            type: "string",
+            description: "Absolute path to the local book cache directory. Falls back to plugin config when omitted.",
+          },
+          resultIndex: {
+            type: "integer",
+            minimum: 1,
+            description: "Fallback 1-based result index used only when selectionToken is omitted.",
+          },
+          timeoutMs: {
+            type: "integer",
+            minimum: 1000,
+            description: "Optional timeout override in milliseconds.",
+          },
+          forceRefresh: {
+            type: "boolean",
+            description: "Skip cache reuse and force a fresh remote download.",
+          },
+        },
+        required: [],
+      },
+      execute: async (_toolCallId, params, signal) => {
+        const result = await downloadBookToLibrary(params, api.pluginConfig, signal);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      },
+    });
+
+    api.registerTool({
+      name: DEFAULT_TOOL_NAME,
+      label: "Library Book Fetch",
+      description:
+        "Compatibility wrapper that checks the local cache first, then searches and downloads from the remote site when needed.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "The main user-provided book name or search phrase.",
+          },
+          titleHint: {
+            type: "string",
+            description: "Optional exact title override. When omitted, the tool uses query as the title hint.",
           },
           authorHint: {
             type: "string",

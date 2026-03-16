@@ -11,6 +11,65 @@ import { loadAgentBrowserSessionConfig } from "./playbooks.mjs";
 const DOWNLOAD_EXTENSIONS = [".pdf", ".epub", ".mobi", ".azw3", ".djvu", ".txt", ".zip"];
 const MIN_RESULT_SCORE = 24;
 
+export async function searchAgentBrowserPlaybook({
+  params,
+  pluginConfig,
+  playbook,
+  tempRoot,
+  downloadTimeoutMs,
+  signal,
+}) {
+  const browserOptions = await createBrowserOptions({
+    pluginConfig,
+    playbook,
+    tempRoot,
+    signal,
+  });
+  await validateBrowserBootstrap(browserOptions);
+
+  const state = {
+    results: [],
+    selectedResult: null,
+    detail: {},
+    currentUrl: "",
+    currentTitle: "",
+    llmFallbackUsed: false,
+    fallback: {},
+    failureDiagnostics: null,
+  };
+
+  try {
+    for (const step of playbook.steps) {
+      await executeStep({
+        step,
+        state,
+        params,
+        playbook,
+        pluginConfig,
+        browserOptions,
+        tempRoot,
+        downloadTimeoutMs,
+      });
+
+      if (step.type === "extract-results") {
+        return {
+          results: state.results,
+          currentUrl: state.currentUrl,
+          currentTitle: state.currentTitle,
+          llmFallbackUsed: state.llmFallbackUsed,
+        };
+      }
+    }
+  } catch (error) {
+    await collectFailureDiagnostics(state, browserOptions, downloadTimeoutMs);
+    throw error;
+  } finally {
+    await runAgentBrowser(["close"], browserOptions, 15000).catch(() => {});
+  }
+
+  throw new Error(`Playbook "${playbook.id}" does not define an extract-results step.`);
+}
+
 export async function executeAgentBrowserPlaybook({
   params,
   pluginConfig,
@@ -19,35 +78,12 @@ export async function executeAgentBrowserPlaybook({
   downloadTimeoutMs,
   signal,
 }) {
-  const downloadDir = path.join(tempRoot, "downloads");
-  await mkdir(downloadDir, { recursive: true });
-
-  const sessionRuntime = await loadAgentBrowserSessionConfig(pluginConfig);
-  const resolvedSessionName =
-    sessionRuntime.config.sessionName ??
-    playbook.browser.sessionName ??
-    `library-fetch-${randomUUID()}`;
-  const resolvedProfilePath =
-    sessionRuntime.config.profilePath ??
-    pluginConfig.browserProfilePath ??
-    playbook.browser.profilePath;
-
-  const browserOptions = {
-    binary: pluginConfig.agentBrowserPath ?? "agent-browser",
-    sessionName: resolvedSessionName,
-    profilePath: resolvedProfilePath,
-    downloadDir,
-    headed: sessionRuntime.config.headed ?? playbook.browser.headed,
-    ignoreHttpsErrors:
-      sessionRuntime.config.ignoreHttpsErrors ?? playbook.browser.ignoreHttpsErrors,
-    proxy: sessionRuntime.config.proxy ?? playbook.browser.proxy,
-    sessionConfigPath: sessionRuntime.sessionConfigPath,
-    sessionConfigExists: sessionRuntime.exists,
-    initUrl: deriveInitUrl(playbook),
-    requireAuthenticatedProfile: Boolean(playbook.browser.requireAuthenticatedProfile),
+  const browserOptions = await createBrowserOptions({
+    pluginConfig,
+    playbook,
+    tempRoot,
     signal,
-  };
-
+  });
   await validateBrowserBootstrap(browserOptions);
 
   const state = {
@@ -99,10 +135,14 @@ export async function executeAgentBrowserPlaybook({
       params.titleHint ??
       params.query,
     author: state.detail.author ?? state.selectedResult?.author ?? "",
-    sourceUrl: state.selectedResult?.href ?? state.currentUrl ?? "",
+    sourceUrl: normalizeResultSourceUrl(state.currentUrl, state.selectedResult?.href),
     downloadUrl: state.detail.downloadUrl ?? state.selectedResult?.downloadUrl ?? "",
     llmFallbackUsed: state.llmFallbackUsed,
   };
+}
+
+export function scoreSearchResult(result, params) {
+  return scoreResult(result, params);
 }
 
 async function executeStep({
@@ -272,6 +312,8 @@ async function executeStep({
           browserOptions,
           timeoutMs: downloadTimeoutMs,
         });
+        state.currentUrl = await readCurrentUrl(browserOptions, downloadTimeoutMs).catch(() => "");
+        state.currentTitle = await readCurrentTitle(browserOptions, downloadTimeoutMs).catch(() => "");
         const immediateDownload = await waitForNewDownloadFile({
           downloadDir: browserOptions.downloadDir,
           beforeFiles: startedFiles,
@@ -460,6 +502,37 @@ async function executeStep({
       throw new Error(`Unsupported playbook step type: ${step.type}`);
     }
   }
+}
+
+async function createBrowserOptions({ pluginConfig, playbook, tempRoot, signal }) {
+  const downloadDir = path.join(tempRoot, "downloads");
+  await mkdir(downloadDir, { recursive: true });
+
+  const sessionRuntime = await loadAgentBrowserSessionConfig(pluginConfig);
+  const resolvedSessionName =
+    sessionRuntime.config.sessionName ??
+    playbook.browser.sessionName ??
+    `library-fetch-${randomUUID()}`;
+  const resolvedProfilePath =
+    sessionRuntime.config.profilePath ??
+    pluginConfig.browserProfilePath ??
+    playbook.browser.profilePath;
+
+  return {
+    binary: pluginConfig.agentBrowserPath ?? "agent-browser",
+    sessionName: resolvedSessionName,
+    profilePath: resolvedProfilePath,
+    downloadDir,
+    headed: sessionRuntime.config.headed ?? playbook.browser.headed,
+    ignoreHttpsErrors:
+      sessionRuntime.config.ignoreHttpsErrors ?? playbook.browser.ignoreHttpsErrors,
+    proxy: sessionRuntime.config.proxy ?? playbook.browser.proxy,
+    sessionConfigPath: sessionRuntime.sessionConfigPath,
+    sessionConfigExists: sessionRuntime.exists,
+    initUrl: deriveInitUrl(playbook),
+    requireAuthenticatedProfile: Boolean(playbook.browser.requireAuthenticatedProfile),
+    signal,
+  };
 }
 
 async function extractResults(step, browserOptions, timeoutMs) {
@@ -1213,6 +1286,20 @@ function deriveInitUrl(playbook) {
   } catch {
     return openStep.url;
   }
+}
+
+function normalizeResultSourceUrl(currentUrl, fallbackHref) {
+  const current = String(currentUrl ?? "").trim();
+  if (current && !current.startsWith("@")) {
+    return current;
+  }
+
+  const fallback = String(fallbackHref ?? "").trim();
+  if (fallback && !fallback.startsWith("@")) {
+    return fallback;
+  }
+
+  return "";
 }
 
 function indentBlock(value, spaces) {

@@ -8,6 +8,16 @@
 - records the download in a local SQLite cache for future reuse
 - can call an external LLM repair command when a playbook step fails
 
+The plugin also exposes narrower tools for OpenClaw:
+
+- `library_cache_lookup`: local SQLite cache only
+- `library_book_search`: remote search only
+- `library_book_download`: remote download only
+
+`library_book_search` returns a stable `selectionToken` for each result. `library_book_download` should prefer that token instead of browser-specific refs such as `@e41`.
+
+When `selectionToken` is present, `library_book_download` ignores query/titleHint/authorHint/siteId/playbookPath/resultIndex and uses the token as the only selection input. It still checks the local cache first unless you explicitly pass `forceRefresh: true`.
+
 ## Files
 
 - `index.mjs`: OpenClaw plugin entry.
@@ -67,6 +77,8 @@ npm install
   "resultIndex": 1
 }
 ```
+
+In normal use, `query` is the only field users need to provide. `titleHint` is optional and defaults to `query`; it only matters when you want to force a more exact title match than the raw search phrase.
 
 ## Playbook notes
 
