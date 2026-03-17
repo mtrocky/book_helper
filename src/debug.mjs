@@ -1,3 +1,9 @@
+let pluginLogger = null;
+
+export function configureLogger(logger) {
+  pluginLogger = logger && typeof logger === "object" ? logger : null;
+}
+
 export function isDebugEnabled() {
   return (
     process.env.DEBUG_BOOK_FETCH === "1" ||
@@ -13,6 +19,11 @@ export function isInfoEnabled() {
 }
 
 export function debug(message, details) {
+  if (pluginLogger?.debug) {
+    pluginLogger.debug(formatLogMessage(message, details));
+    return;
+  }
+
   if (!isDebugEnabled()) {
     return;
   }
@@ -21,6 +32,11 @@ export function debug(message, details) {
 }
 
 export function info(message, details) {
+  if (pluginLogger?.info) {
+    pluginLogger.info(formatLogMessage(message, details));
+    return;
+  }
+
   if (!isInfoEnabled()) {
     return;
   }
@@ -37,6 +53,13 @@ function writeLog(message, details) {
   process.stderr.write(
     `[book-fetch] ${message}: ${safeStringify(details)}\n`,
   );
+}
+
+function formatLogMessage(message, details) {
+  if (details === undefined) {
+    return `[book-fetch] ${message}`;
+  }
+  return `[book-fetch] ${message}: ${safeStringify(details)}`;
 }
 
 function safeStringify(value) {

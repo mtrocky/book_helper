@@ -1,5 +1,5 @@
 {
-  "name": "openclaw-library-fetcher",
+  "name": "library-fetcher",
   "version": "0.1.0",
   "description": "OpenClaw plugin that searches a configured web library and downloads books into a local cache.",
   "type": "module",

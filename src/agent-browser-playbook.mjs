@@ -1,15 +1,24 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { createWriteStream } from "node:fs";
-import { access, mkdir, readdir } from "node:fs/promises";
+import { access, mkdir, readdir, stat } from "node:fs/promises";
 import path from "node:path";
-import { pipeline } from "node:stream/promises";
-import { chromium } from "playwright";
-import { debug } from "./debug.mjs";
+import { debug, info } from "./debug.mjs";
 import { loadAgentBrowserSessionConfig } from "./playbooks.mjs";
+import {
+  buildSafeFileName,
+  estimateDownloadTimeoutMs,
+  guessExtension,
+  parseSizeHintToBytes,
+  pickResult,
+  scoreResult,
+} from "./playbook-runtime-utils.mjs";
+import {
+  executePlaywrightZLibraryPlaybook,
+  searchPlaywrightZLibraryPlaybook,
+  supportsPlaywrightZLibrary,
+} from "./playwright-zlibrary.mjs";
 
-const DOWNLOAD_EXTENSIONS = [".pdf", ".epub", ".mobi", ".azw3", ".djvu", ".txt", ".zip"];
-const MIN_RESULT_SCORE = 24;
+const PROGRESS_LOG_INTERVAL_MS = 2000;
 
 export async function searchAgentBrowserPlaybook({
   params,
@@ -17,6 +26,7 @@ export async function searchAgentBrowserPlaybook({
   playbook,
   tempRoot,
   downloadTimeoutMs,
+  downloadTimingModel,
   signal,
 }) {
   const browserOptions = await createBrowserOptions({
@@ -27,6 +37,17 @@ export async function searchAgentBrowserPlaybook({
   });
   await validateBrowserBootstrap(browserOptions);
 
+  if (supportsPlaywrightZLibrary(playbook)) {
+    return searchPlaywrightZLibraryPlaybook({
+      params,
+      playbook,
+      browserOptions,
+      downloadTimeoutMs,
+      signal,
+      onBrowserError: (message) => buildAgentBrowserError(message, browserOptions),
+    });
+  }
+
   const state = {
     results: [],
     selectedResult: null,
@@ -36,6 +57,7 @@ export async function searchAgentBrowserPlaybook({
     llmFallbackUsed: false,
     fallback: {},
     failureDiagnostics: null,
+    downloadMetrics: null,
   };
 
   try {
@@ -76,6 +98,7 @@ export async function executeAgentBrowserPlaybook({
   playbook,
   tempRoot,
   downloadTimeoutMs,
+  downloadTimingModel,
   signal,
 }) {
   const browserOptions = await createBrowserOptions({
@@ -86,6 +109,19 @@ export async function executeAgentBrowserPlaybook({
   });
   await validateBrowserBootstrap(browserOptions);
 
+  if (supportsPlaywrightZLibrary(playbook)) {
+    return executePlaywrightZLibraryPlaybook({
+      params,
+      playbook,
+      browserOptions,
+      tempRoot,
+      downloadTimeoutMs,
+      downloadTimingModel,
+      signal,
+      onBrowserError: (message) => buildAgentBrowserError(message, browserOptions),
+    });
+  }
+
   const state = {
     results: [],
     selectedResult: null,
@@ -95,6 +131,7 @@ export async function executeAgentBrowserPlaybook({
     llmFallbackUsed: false,
     fallback: {},
     failureDiagnostics: null,
+    downloadMetrics: null,
   };
 
   try {
@@ -108,6 +145,7 @@ export async function executeAgentBrowserPlaybook({
         browserOptions,
         tempRoot,
         downloadTimeoutMs,
+        downloadTimingModel,
       });
     }
   } catch (error) {
@@ -138,6 +176,7 @@ export async function executeAgentBrowserPlaybook({
     sourceUrl: normalizeResultSourceUrl(state.currentUrl, state.selectedResult?.href),
     downloadUrl: state.detail.downloadUrl ?? state.selectedResult?.downloadUrl ?? "",
     llmFallbackUsed: state.llmFallbackUsed,
+    downloadMetrics: state.downloadMetrics ?? null,
   };
 }
 
@@ -154,6 +193,7 @@ async function executeStep({
   browserOptions,
   tempRoot,
   downloadTimeoutMs,
+  downloadTimingModel,
 }) {
   const context = buildTemplateContext(params, state);
   debug(`step ${step.name} (${step.type})`);
@@ -247,7 +287,7 @@ async function executeStep({
       }
 
       state.selectedResult = selectedResult;
-      await runAgentBrowser(["open", selectedResult.href], browserOptions, downloadTimeoutMs);
+      await openResultTarget(selectedResult.href, browserOptions, downloadTimeoutMs);
       state.currentUrl = await readCurrentUrl(browserOptions, downloadTimeoutMs);
       state.currentTitle = await readCurrentTitle(browserOptions, downloadTimeoutMs).catch(() => "");
       return;
@@ -301,10 +341,14 @@ async function executeStep({
 
       state.selectedResult = selectedResult;
       debug("selected result for direct download", selectedResult);
-      const titleForPath =
-        selectedResult.title ?? params.titleHint ?? params.query;
+      info("download candidate selected", {
+        title: selectedResult.title ?? params.titleHint ?? params.query,
+        author: selectedResult.author ?? "",
+        publisher: selectedResult.publisher ?? "",
+        format: selectedResult.format ?? "",
+      });
+      const titleForPath = selectedResult.title ?? params.titleHint ?? params.query;
       const startedFiles = await listFiles(browserOptions.downloadDir);
-      let detailDownload = null;
 
       if (selectedResult.downloadRef) {
         await runDownloadCommand({
@@ -314,100 +358,58 @@ async function executeStep({
         });
         state.currentUrl = await readCurrentUrl(browserOptions, downloadTimeoutMs).catch(() => "");
         state.currentTitle = await readCurrentTitle(browserOptions, downloadTimeoutMs).catch(() => "");
-        const immediateDownload = await waitForNewDownloadFile({
-          downloadDir: browserOptions.downloadDir,
-          beforeFiles: startedFiles,
-          timeoutMs: Math.min(downloadTimeoutMs, 2500),
-        });
-        if (immediateDownload) {
-          state.downloadedFilePath = immediateDownload;
-          return;
-        }
-
-        const detailSnapshot = await readSnapshot(browserOptions, downloadTimeoutMs).catch(() => "");
-        detailDownload = parseDetailDownloadRef(detailSnapshot);
-        if (detailDownload) {
-          debug("detail page download ref", detailDownload);
-          const directTarget = await extractDirectDownloadTarget(browserOptions, downloadTimeoutMs).catch(
-            () => null,
-          );
-          if (directTarget?.downloadUrl) {
-            debug("detail page direct download target", directTarget);
-            selectedResult.downloadUrl = directTarget.downloadUrl;
-            selectedResult.format = selectedResult.format || directTarget.format;
-          } else {
-            await runDownloadCommand({
-              selector: detailDownload.selector,
-              browserOptions,
-              timeoutMs: downloadTimeoutMs,
-            });
-            selectedResult.format = selectedResult.format || detailDownload.format;
-          }
-        }
       } else {
-        try {
-          await runAgentBrowser(["open", selectedResult.downloadUrl], browserOptions, downloadTimeoutMs);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          if (!message.includes("net::ERR_ABORTED")) {
-            throw error;
-          }
-        }
+        await runAgentBrowser(["open", selectedResult.downloadUrl], browserOptions, downloadTimeoutMs);
+        state.currentUrl = await readCurrentUrl(browserOptions, downloadTimeoutMs).catch(() => "");
+        state.currentTitle = await readCurrentTitle(browserOptions, downloadTimeoutMs).catch(() => "");
       }
+
+      const timing = await selectAdaptiveDownloadTiming({
+        baseTimeoutMs: downloadTimeoutMs,
+        playbookId: playbook.id,
+        backend: "agent-browser",
+        format: selectedResult.format,
+        downloadTimingModel,
+      });
+      const effectiveDownloadTimeoutMs = timing.effectiveTimeoutMs;
+      info("download timeout selected", {
+        title: titleForPath,
+        baseTimeoutMs: downloadTimeoutMs,
+        effectiveTimeoutMs: effectiveDownloadTimeoutMs,
+        format: selectedResult.format ?? "",
+        estimatedBytes: timing.expectedBytes,
+        modelPredictedSeconds: timing.model?.predictedSeconds ?? null,
+        modelRawPredictedSeconds: timing.model?.rawPredictedSeconds ?? null,
+        modelErrorBias: timing.model?.errorBias ?? null,
+        modelSampleCount: timing.model?.sampleCount ?? 0,
+      });
 
       const extension = guessExtension({
         downloadUrl: selectedResult.downloadUrl,
         format: selectedResult.format,
       });
       const downloadTargetPath = path.join(tempRoot, buildSafeFileName(titleForPath, extension));
-
-      if (selectedResult.downloadUrl) {
-        const sessionDownload = await downloadViaSessionHttp({
-          url: selectedResult.downloadUrl,
-          referer: state.currentUrl || (await readCurrentUrl(browserOptions, downloadTimeoutMs).catch(() => "")),
-          browserOptions,
-          timeoutMs: downloadTimeoutMs,
-          targetPath: downloadTargetPath,
-        }).catch((error) => {
-          debug("session http download failed", {
-            message: error instanceof Error ? error.message : String(error),
-            url: selectedResult.downloadUrl,
-          });
-          return null;
-        });
-        if (sessionDownload) {
-          state.downloadedFilePath = sessionDownload;
-          return;
-        }
-
-        if (selectedResult.downloadUrl) {
-          const playwrightDownload = await downloadViaPlaywrightCdp({
-            browserOptions,
-            pageUrl: state.currentUrl || (await readCurrentUrl(browserOptions, downloadTimeoutMs).catch(() => "")),
-            downloadUrl: selectedResult.downloadUrl,
-            targetPath: downloadTargetPath,
-            timeoutMs: downloadTimeoutMs,
-          }).catch((error) => {
-            debug("playwright cdp download failed", {
-              message: error instanceof Error ? error.message : String(error),
-              url: selectedResult.downloadUrl,
-              targetPath: downloadTargetPath,
-            });
-            return null;
-          });
-          if (playwrightDownload) {
-            state.downloadedFilePath = playwrightDownload;
-            return;
-          }
-        }
-      }
+      const downloadStartedAt = Date.now();
 
       state.downloadedFilePath = await resolveDownloadedFile({
         targetPath: downloadTargetPath,
         reportedPath: null,
         downloadDir: browserOptions.downloadDir,
         beforeFiles: startedFiles,
-        timeoutMs: downloadTimeoutMs,
+        timeoutMs: effectiveDownloadTimeoutMs,
+        expectedBytes: timing.expectedBytes,
+      });
+      state.downloadMetrics = {
+        backend: "agent-browser",
+        format: selectedResult.format ?? "",
+        fileSizeBytes: await readFileSizeSafe(state.downloadedFilePath),
+        expectedBytes: timing.expectedBytes,
+        predictedSeconds: timing.model?.predictedSeconds ?? null,
+        predictedTimeoutMs: effectiveDownloadTimeoutMs,
+        durationSeconds: roundNumber((Date.now() - downloadStartedAt) / 1000, 2),
+      };
+      info("download completed via browser-managed path", {
+        path: state.downloadedFilePath,
       });
       return;
     }
@@ -442,6 +444,26 @@ async function executeStep({
       const downloadTargetPath = path.join(tempRoot, buildSafeFileName(titleForPath, extension));
       const startedFiles = await listFiles(browserOptions.downloadDir);
       let reportedDownloadPath = null;
+      const timing = await selectAdaptiveDownloadTiming({
+        baseTimeoutMs: downloadTimeoutMs,
+        playbookId: playbook.id,
+        backend: "agent-browser",
+        format: state.detail.format,
+        downloadTimingModel,
+      });
+      const effectiveDownloadTimeoutMs = timing.effectiveTimeoutMs;
+      info("download step timeout selected", {
+        title: titleForPath,
+        baseTimeoutMs: downloadTimeoutMs,
+        effectiveTimeoutMs: effectiveDownloadTimeoutMs,
+        format: state.detail.format ?? "",
+        estimatedBytes: timing.expectedBytes,
+        modelPredictedSeconds: timing.model?.predictedSeconds ?? null,
+        modelRawPredictedSeconds: timing.model?.rawPredictedSeconds ?? null,
+        modelErrorBias: timing.model?.errorBias ?? null,
+        modelSampleCount: timing.model?.sampleCount ?? 0,
+      });
+      const downloadStartedAt = Date.now();
 
       try {
         const selector =
@@ -451,7 +473,7 @@ async function executeStep({
         reportedDownloadPath = await runDownloadCommand({
           selector,
           browserOptions,
-          timeoutMs: downloadTimeoutMs,
+          timeoutMs: effectiveDownloadTimeoutMs,
         });
       } catch (error) {
         const fallback = await tryLlmFallback({
@@ -463,7 +485,7 @@ async function executeStep({
           playbook,
           pluginConfig,
           browserOptions,
-          downloadTimeoutMs,
+          downloadTimeoutMs: effectiveDownloadTimeoutMs,
           downloadTargetPath,
         });
         applyFallback(state, fallback);
@@ -472,7 +494,7 @@ async function executeStep({
           await runFallbackCommands({
             commands: fallback.commands,
             browserOptions,
-            downloadTimeoutMs,
+            downloadTimeoutMs: effectiveDownloadTimeoutMs,
             context: buildTemplateContext(params, state, { downloadTargetPath }),
           });
         }
@@ -481,7 +503,7 @@ async function executeStep({
           reportedDownloadPath = await runDownloadCommand({
             selector: fallback.downloadSelector,
             browserOptions,
-            timeoutMs: downloadTimeoutMs,
+            timeoutMs: effectiveDownloadTimeoutMs,
           });
         } else if (!fallback?.commands?.length) {
           throw error;
@@ -494,7 +516,20 @@ async function executeStep({
         reportedPath: reportedDownloadPath,
         downloadDir: browserOptions.downloadDir,
         beforeFiles: startedFiles,
-        timeoutMs: downloadTimeoutMs,
+        timeoutMs: effectiveDownloadTimeoutMs,
+        expectedBytes: timing.expectedBytes,
+      });
+      state.downloadMetrics = {
+        backend: "agent-browser",
+        format: state.detail.format ?? "",
+        fileSizeBytes: await readFileSizeSafe(state.downloadedFilePath),
+        expectedBytes: timing.expectedBytes,
+        predictedSeconds: timing.model?.predictedSeconds ?? null,
+        predictedTimeoutMs: effectiveDownloadTimeoutMs,
+        durationSeconds: roundNumber((Date.now() - downloadStartedAt) / 1000, 2),
+      };
+      info("download completed via browser-managed path", {
+        path: state.downloadedFilePath,
       });
       return;
     }
@@ -557,34 +592,16 @@ async function extractDetail(step, browserOptions, timeoutMs) {
   return JSON.parse(payload);
 }
 
-async function extractDirectDownloadTarget(browserOptions, timeoutMs) {
-  const payload = await runAgentBrowser(
-    ["eval", buildExtractDirectDownloadScript()],
-    browserOptions,
-    timeoutMs,
-  );
-  return JSON.parse(payload);
-}
-
-async function readUserAgent(browserOptions, timeoutMs) {
-  const payload = await runAgentBrowser(["eval", "navigator.userAgent"], browserOptions, timeoutMs);
-  return typeof payload === "string" ? payload : String(payload ?? "");
-}
-
-async function readCookies(browserOptions, timeoutMs) {
-  const data = await runAgentBrowser(["cookies", "get"], browserOptions, timeoutMs);
-  return Array.isArray(data?.cookies) ? data.cookies : [];
-}
-
-async function readCdpUrl(browserOptions, timeoutMs) {
-  const data = await runAgentBrowser(["get", "cdp-url"], browserOptions, timeoutMs);
-  return typeof data?.cdpUrl === "string"
-    ? data.cdpUrl
-    : typeof data?.url === "string"
-    ? data.url
-    : typeof data === "string"
-    ? data
-    : "";
+async function openResultTarget(target, browserOptions, timeoutMs) {
+  const value = String(target || "").trim();
+  if (!value) {
+    throw new Error("Missing result target.");
+  }
+  if (value.startsWith("@")) {
+    await runAgentBrowser(["click", value], browserOptions, timeoutMs);
+    return;
+  }
+  await runAgentBrowser(["open", value], browserOptions, timeoutMs);
 }
 
 async function runDownloadCommand({ selector, browserOptions, timeoutMs, targetPath = null }) {
@@ -818,173 +835,6 @@ function buildExtractDetailScript(step) {
   })()`;
 }
 
-function buildExtractDirectDownloadScript() {
-  return `(() => {
-    const anchors = Array.from(document.querySelectorAll("a"));
-    const candidate = anchors.find((node) => {
-      const text = (node.textContent || "").trim();
-      const href = node.href || "";
-      if (!/\\b(EPUB|PDF|MOBI|AZW3?|TXT|RTF|DJVU|FB2|CBZ)\\b/i.test(text)) return false;
-      if (!href || /^javascript:/i.test(href)) return false;
-      return true;
-    });
-    return JSON.stringify({
-      text: candidate ? (candidate.textContent || "").trim() : "",
-      downloadUrl: candidate?.href || "",
-      format: candidate ? (candidate.textContent || "").trim() : "",
-    });
-  })()`;
-}
-
-async function downloadViaSessionHttp({ url, referer, browserOptions, timeoutMs, targetPath }) {
-  const cookies = await readCookies(browserOptions, timeoutMs);
-  const userAgent = await readUserAgent(browserOptions, timeoutMs).catch(() => "");
-  const response = await fetchWithSession({
-    url,
-    referer,
-    userAgent,
-    cookies,
-    timeoutMs,
-  });
-
-  if (!response.ok || !response.body) {
-    throw new Error(`HTTP download failed with status ${response.status}.`);
-  }
-
-  await pipeline(response.body, createWriteStream(targetPath));
-  return targetPath;
-}
-
-async function downloadViaPlaywrightCdp({ browserOptions, pageUrl, downloadUrl, targetPath, timeoutMs }) {
-  const cdpUrl = await readCdpUrl(browserOptions, timeoutMs);
-  if (!cdpUrl) {
-    throw new Error("Missing CDP URL for current browser session.");
-  }
-
-  const browser = await chromium.connectOverCDP(cdpUrl, { timeout: timeoutMs });
-  try {
-    const page = findBestPage(browser, pageUrl);
-    if (!page) {
-      throw new Error("No active page found in browser CDP session.");
-    }
-
-    const target = new URL(downloadUrl);
-    const hrefSelector = `a[href$="${target.pathname}"]`;
-    const locator = page.locator(hrefSelector).first();
-    const download = await Promise.all([
-      page.waitForEvent("download", { timeout: timeoutMs }),
-      locator.count().then((count) => {
-        if (count > 0) {
-          return locator.click();
-        }
-        return page.evaluate((url) => {
-          window.location.assign(url);
-        }, downloadUrl);
-      }),
-    ]).then(([result]) => result);
-
-    await download.saveAs(targetPath);
-    return targetPath;
-  } finally {
-    await browser.close().catch(() => {});
-  }
-}
-
-async function fetchWithSession({ url, referer, userAgent, cookies, timeoutMs, redirectCount = 0 }) {
-  if (redirectCount > 5) {
-    throw new Error("Too many redirects while downloading.");
-  }
-
-  const headers = {
-    Accept: "*/*",
-  };
-  if (referer) headers.Referer = referer;
-  if (userAgent) headers["User-Agent"] = userAgent;
-
-  const cookieHeader = buildCookieHeader(cookies, url);
-  if (cookieHeader) headers.Cookie = cookieHeader;
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, {
-      method: "GET",
-      headers,
-      redirect: "manual",
-      signal: controller.signal,
-    });
-
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
-      const location = response.headers.get("location");
-      if (!location) {
-        throw new Error(`Redirect response missing location header (${response.status}).`);
-      }
-      const nextUrl = new URL(location, url).toString();
-      return fetchWithSession({
-        url: nextUrl,
-        referer: url,
-        userAgent,
-        cookies,
-        timeoutMs,
-        redirectCount: redirectCount + 1,
-      });
-    }
-
-    return response;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function buildCookieHeader(cookies, url) {
-  const target = new URL(url);
-  const pairs = cookies
-    .filter((cookie) => shouldSendCookie(cookie, target))
-    .map((cookie) => `${cookie.name}=${cookie.value}`);
-  return pairs.join("; ");
-}
-
-function findBestPage(browser, pageUrl) {
-  const pages = browser.contexts().flatMap((context) => context.pages());
-  if (!pages.length) {
-    return null;
-  }
-  if (pageUrl) {
-    const exact = pages.find((page) => page.url() === pageUrl);
-    if (exact) {
-      return exact;
-    }
-  }
-  return pages[0];
-}
-
-function shouldSendCookie(cookie, target) {
-  if (!cookie || !cookie.name) {
-    return false;
-  }
-
-  if (cookie.secure && target.protocol !== "https:") {
-    return false;
-  }
-
-  const host = target.hostname.toLowerCase();
-  const domain = String(cookie.domain ?? "").replace(/^\./, "").toLowerCase();
-  if (domain && host !== domain && !host.endsWith(`.${domain}`)) {
-    return false;
-  }
-
-  const cookiePath = cookie.path || "/";
-  if (!target.pathname.startsWith(cookiePath)) {
-    return false;
-  }
-
-  if (typeof cookie.expires === "number" && cookie.expires > 0 && cookie.expires * 1000 < Date.now()) {
-    return false;
-  }
-
-  return true;
-}
-
 function parseDownloadListSnapshot(snapshot) {
   const lines = String(snapshot ?? "").split("\n");
   const results = [];
@@ -1067,27 +917,6 @@ function parseDownloadListSnapshot(snapshot) {
   }
 
   return results;
-}
-
-function parseDetailDownloadRef(snapshot) {
-  const lines = String(snapshot ?? "").split("\n");
-  for (const line of lines) {
-    const match = line.match(/^\s*- link "(.+?)" \[ref=(e\d+)\]$/);
-    if (!match) {
-      continue;
-    }
-    const [, text, ref] = match;
-    if (/read online/i.test(text)) {
-      continue;
-    }
-    if (/\b(EPUB|PDF|MOBI|AZW3?|TXT|RTF|DJVU|FB2|CBZ)\b/i.test(text)) {
-      return {
-        selector: `@${ref}`,
-        format: text.trim(),
-      };
-    }
-  }
-  return null;
 }
 
 function buildTemplateContext(params, state, extra = {}) {
@@ -1302,6 +1131,35 @@ function normalizeResultSourceUrl(currentUrl, fallbackHref) {
   return "";
 }
 
+async function selectAdaptiveDownloadTiming({
+  baseTimeoutMs,
+  playbookId,
+  backend,
+  format,
+  downloadTimingModel,
+}) {
+  const expectedBytes = parseSizeHintToBytes(format ?? "");
+  const heuristicTimeoutMs = estimateDownloadTimeoutMs({
+    baseTimeoutMs,
+    format,
+  });
+  const model =
+    typeof downloadTimingModel?.estimateTimeout === "function"
+      ? await downloadTimingModel.estimateTimeout({
+          playbookId,
+          backend,
+          expectedBytes,
+        })
+      : null;
+
+  return {
+    expectedBytes,
+    heuristicTimeoutMs,
+    model,
+    effectiveTimeoutMs: Math.max(heuristicTimeoutMs, model?.timeoutMs ?? 0),
+  };
+}
+
 function indentBlock(value, spaces) {
   const prefix = " ".repeat(spaces);
   return String(value)
@@ -1340,126 +1198,123 @@ function escapeSingleQuotedJsonValue(value) {
   return JSON.stringify(String(value)).replace(/'/g, `'\"'\"'`);
 }
 
-async function resolveDownloadedFile({ targetPath, reportedPath, downloadDir, beforeFiles, timeoutMs }) {
+async function resolveDownloadedFile({
+  targetPath,
+  reportedPath,
+  downloadDir,
+  beforeFiles,
+  timeoutMs,
+  expectedBytes = null,
+}) {
   const deadline = Date.now() + timeoutMs;
+  const reportProgress = createDownloadProgressReporter({
+    channel: "browser-managed",
+    targetPath,
+    totalBytes: expectedBytes,
+  });
   while (Date.now() < deadline) {
     if (reportedPath && (await exists(reportedPath))) {
+      reportProgress(await readFileSizeSafe(reportedPath), { force: true });
       return reportedPath;
     }
     if (await exists(targetPath)) {
+      reportProgress(await readFileSizeSafe(targetPath), { force: true });
       return targetPath;
     }
     const files = await listFiles(downloadDir);
     for (const file of files) {
       if (!beforeFiles.has(file)) {
+        reportProgress(await readFileSizeSafe(file), { force: true });
         return file;
       }
+    }
+    const progressPath =
+      (reportedPath && (await exists(reportedPath)) && reportedPath) ||
+      ((await exists(targetPath)) && targetPath) ||
+      null;
+    if (progressPath) {
+      reportProgress(await readFileSizeSafe(progressPath));
     }
     await sleep(750);
   }
 
+  info("browser-managed download timed out", {
+    targetPath,
+    reportedPath,
+    timeoutMs,
+    expectedBytes,
+  });
   throw new Error(`Timed out waiting for browser download after ${timeoutMs}ms.`);
 }
 
-async function waitForNewDownloadFile({ downloadDir, beforeFiles, timeoutMs }) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const files = await listFiles(downloadDir);
-    for (const file of files) {
-      if (!beforeFiles.has(file)) {
-        return file;
-      }
+function createDownloadProgressReporter({ channel, targetPath, totalBytes }) {
+  const startedAt = Date.now();
+  let transferredBytes = 0;
+  let lastLogAt = 0;
+  let lastLoggedBytes = 0;
+  let lastLoggedPercentBucket = -1;
+
+  return (deltaOrAbsoluteBytes, options = {}) => {
+    const force = Boolean(options.force);
+    if (force) {
+      transferredBytes = Math.max(transferredBytes, Number(deltaOrAbsoluteBytes) || 0);
+    } else {
+      transferredBytes += Math.max(0, Number(deltaOrAbsoluteBytes) || 0);
     }
-    await sleep(250);
-  }
 
-  return null;
+    const now = Date.now();
+    const percent = totalBytes ? Math.min(100, (transferredBytes / totalBytes) * 100) : null;
+    const percentBucket = percent === null ? null : Math.floor(percent / 5);
+    const shouldLog =
+      force ||
+      lastLogAt === 0 ||
+      (
+        now - lastLogAt >= PROGRESS_LOG_INTERVAL_MS &&
+        (
+          transferredBytes - lastLoggedBytes >= 512 * 1024 ||
+          (percentBucket !== null && percentBucket > lastLoggedPercentBucket)
+        )
+      );
+
+    if (!shouldLog) {
+      return;
+    }
+
+    const elapsedSeconds = Math.max((now - startedAt) / 1000, 0.001);
+    const bytesPerSecond = transferredBytes / elapsedSeconds;
+    const etaSeconds =
+      totalBytes && bytesPerSecond > 0
+        ? Math.max(0, (totalBytes - transferredBytes) / bytesPerSecond)
+        : null;
+
+    info("download progress", {
+      channel,
+      targetPath,
+      receivedBytes: transferredBytes,
+      totalBytes,
+      percent: percent === null ? null : roundNumber(percent, 1),
+      speedMbps: roundNumber((bytesPerSecond * 8) / 1_000_000, 2),
+      etaSeconds: etaSeconds === null ? null : roundNumber(etaSeconds, 1),
+    });
+
+    lastLogAt = now;
+    lastLoggedBytes = transferredBytes;
+    lastLoggedPercentBucket = percentBucket ?? lastLoggedPercentBucket;
+  };
 }
 
-function pickResult(results, params) {
-  if (!Array.isArray(results) || results.length === 0) {
-    return null;
-  }
-
-  if (params.resultIndex && results[params.resultIndex - 1]) {
-    return results[params.resultIndex - 1];
-  }
-
-  const best = results
-    .map((result) => ({ result, score: scoreResult(result, params) }))
-    .sort((left, right) => right.score - left.score)[0];
-
-  debug("best result candidate", best ?? null);
-  if (!best || best.score < MIN_RESULT_SCORE) {
-    return null;
-  }
-
-  return best.result;
-}
-
-function scoreResult(result, params) {
-  const title = normalizeText(result.title);
-  const author = normalizeText(result.author);
-  const query = normalizeText(params.query);
-  const titleHint = normalizeText(params.titleHint);
-  const authorHint = normalizeText(params.authorHint);
-
-  let score = 0;
-  if (titleHint && title === titleHint) score += 140;
-  if (title.includes(query)) score += 120;
-  if (authorHint && author.includes(authorHint)) score += 40;
-
-  const haystack = `${title} ${author}`;
-  const tokens = tokenize(params.titleHint || params.query);
-  score += tokens.filter((token) => haystack.includes(token)).length * 16;
-  return score;
-}
-
-function guessExtension(detail) {
-  const downloadUrl = detail.downloadUrl || "";
+async function readFileSizeSafe(targetPath) {
   try {
-    const extension = path.extname(new URL(downloadUrl).pathname).toLowerCase();
-    if (DOWNLOAD_EXTENSIONS.includes(extension)) {
-      return extension;
-    }
-  } catch {}
-
-  const format = String(detail.format ?? "").toLowerCase();
-  for (const extension of DOWNLOAD_EXTENSIONS) {
-    if (format.includes(extension.slice(1))) {
-      return extension;
-    }
+    const details = await stat(targetPath);
+    return details.size;
+  } catch {
+    return 0;
   }
-  return ".bin";
 }
 
-function buildSafeFileName(title, extension) {
-  const stem = sanitizeFileName(title || "downloaded-book");
-  const safeExtension = extension.startsWith(".") ? extension : `.${extension || "bin"}`;
-  return `${stem}${safeExtension}`;
-}
-
-function sanitizeFileName(value) {
-  return (value || "downloaded-book")
-    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 120)
-    .replace(/\s/g, "_");
-}
-
-function normalizeText(value) {
-  return String(value || "")
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[^\p{Letter}\p{Number}]+/gu, " ")
-    .trim();
-}
-
-function tokenize(value) {
-  return normalizeText(value)
-    .split(/\s+/)
-    .filter((token) => token.length >= 2);
+function roundNumber(value, digits) {
+  const factor = 10 ** digits;
+  return Math.round(value * factor) / factor;
 }
 
 async function listFiles(dir) {

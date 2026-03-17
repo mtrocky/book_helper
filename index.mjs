@@ -1,21 +1,24 @@
 import {
   auditLibraryCache,
+  buildToolErrorResult,
+  CACHE_LOOKUP_TOOL_NAME,
   DEFAULT_TOOL_NAME,
+  DOWNLOAD_TOOL_NAME,
   downloadBookToLibrary,
+  getStatusSnapshot,
   lookupCachedBook,
+  PLUGIN_ID,
   resetLibraryCache,
+  SEARCH_TOOL_NAME,
   searchBooks,
+  startLibraryLogin,
   TOOL_GROUP,
   describeStatus,
   fetchBookToLibrary,
   parsePluginConfig,
   withToolEnabled,
 } from "./src/book-fetcher.mjs";
-
-const PLUGIN_ID = "library-fetcher";
-const CACHE_LOOKUP_TOOL_NAME = "library_cache_lookup";
-const SEARCH_TOOL_NAME = "library_book_search";
-const DOWNLOAD_TOOL_NAME = "library_book_download";
+import { configureLogger } from "./src/debug.mjs";
 
 function cloneObject(value) {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -35,6 +38,9 @@ function resolveToolPolicySource(config) {
   ]) {
     const list = cloneStringList(rawList);
     if (list.includes(DEFAULT_TOOL_NAME)) return `${path} (${DEFAULT_TOOL_NAME})`;
+    if (list.includes(CACHE_LOOKUP_TOOL_NAME)) return `${path} (${CACHE_LOOKUP_TOOL_NAME})`;
+    if (list.includes(SEARCH_TOOL_NAME)) return `${path} (${SEARCH_TOOL_NAME})`;
+    if (list.includes(DOWNLOAD_TOOL_NAME)) return `${path} (${DOWNLOAD_TOOL_NAME})`;
     if (list.includes(PLUGIN_ID)) return `${path} (${PLUGIN_ID})`;
     if (list.includes(TOOL_GROUP)) return `${path} (${TOOL_GROUP})`;
   }
@@ -46,15 +52,42 @@ async function handleBookFetchCommand(api, args) {
   const config = configApi?.loadConfig?.() ?? {};
   const parts = args.split(/\s+/).filter(Boolean);
   const action = parts[0]?.toLowerCase() ?? "status";
+  const jsonMode = parts.includes("--json");
 
   if (action === "status" || action === "help") {
+    if (jsonMode) {
+      const snapshot = await getStatusSnapshot(api.pluginConfig, resolveToolPolicySource(config));
+      return { text: JSON.stringify(snapshot, null, 2) };
+    }
     const statusText = await describeStatus(api.pluginConfig, resolveToolPolicySource(config));
     return { text: statusText };
+  }
+
+  if (action === "login") {
+    const result = await startLibraryLogin({}, api.pluginConfig);
+    if (jsonMode) {
+      return { text: JSON.stringify(result, null, 2) };
+    }
+    return {
+      text: [
+        "Started headed login session.",
+        `Playbook: ${result.playbookId}`,
+        `Session: ${result.sessionName}`,
+        `Profile: ${result.profilePath}`,
+        `Session Config: ${result.sessionConfigPath}`,
+        `URL: ${result.initUrl}`,
+        "",
+        result.nextStep,
+      ].join("\n"),
+    };
   }
 
   if (action === "doctor") {
     const repair = parts.includes("--repair");
     const audit = await auditLibraryCache({ repair }, api.pluginConfig);
+    if (jsonMode) {
+      return { text: JSON.stringify(audit, null, 2) };
+    }
     const lines = [
       "Library cache audit:",
       `Library Root: ${audit.libraryRoot}`,
@@ -93,6 +126,9 @@ async function handleBookFetchCommand(api, args) {
       };
     }
     const result = await resetLibraryCache({ confirm: true }, api.pluginConfig);
+    if (jsonMode) {
+      return { text: JSON.stringify(result, null, 2) };
+    }
     return {
       text: [
         "Library cache reset complete.",
@@ -108,6 +144,7 @@ async function handleBookFetchCommand(api, args) {
         "Book fetcher commands:",
         "",
         "/bookfetch status",
+        "/bookfetch login",
         "/bookfetch doctor",
         "/bookfetch doctor --repair",
         "/bookfetch reset --confirm",
@@ -118,7 +155,7 @@ async function handleBookFetchCommand(api, args) {
 
   if (!configApi?.loadConfig || !configApi?.writeConfigFile) {
     return {
-      text: `This runtime cannot edit tool policy automatically. Add ${DEFAULT_TOOL_NAME}, ${PLUGIN_ID}, or ${TOOL_GROUP} to tools.allow/tools.alsoAllow manually.`,
+      text: `This runtime cannot edit tool policy automatically. Add ${PLUGIN_ID}, ${CACHE_LOOKUP_TOOL_NAME}, ${SEARCH_TOOL_NAME}, ${DOWNLOAD_TOOL_NAME}, ${DEFAULT_TOOL_NAME}, or ${TOOL_GROUP} to tools.allow/tools.alsoAllow manually.`,
     };
   }
 
@@ -132,8 +169,8 @@ async function handleBookFetchCommand(api, args) {
   return {
     text: [
       changed
-        ? `Enabled ${DEFAULT_TOOL_NAME} in ${policyPath}.`
-        : `${DEFAULT_TOOL_NAME} is already enabled via ${policyPath}.`,
+        ? `Enabled library fetcher tools in ${policyPath}.`
+        : `Library fetcher tools are already enabled via ${policyPath}.`,
       "Start a new session or restart the gateway if the agent still does not see the tool.",
       "",
       statusText,
@@ -149,6 +186,9 @@ const libraryFetcherPlugin = {
     parse: parsePluginConfig,
   },
   register(api) {
+    configureLogger(api.logger);
+    api.logger.info("[book-fetch] Registered library fetcher tools and commands");
+
     api.registerCommand({
       name: "bookfetch",
       description: "Show book fetcher status or enable the tool policy.",
@@ -170,23 +210,42 @@ const libraryFetcherPlugin = {
             type: "string",
             description: "Keyword query used to search the local cache.",
           },
+          title: {
+            type: "string",
+            description: "Optional explicit book title. If query is omitted, title is used as the query.",
+          },
           titleHint: {
             type: "string",
             description: "Optional exact title override. When omitted, the tool uses query as the title hint.",
           },
+          author: {
+            type: "string",
+            description: "Optional explicit author name. Maps to authorHint when authorHint is omitted.",
+          },
           authorHint: {
             type: "string",
             description: "Optional author hint for better cache matching.",
+          },
+          language: {
+            type: "string",
+            description: "Optional explicit language. Maps to languageHint when languageHint is omitted.",
+          },
+          languageHint: {
+            type: "string",
+            description: "Optional language hint used to prefer matching language variants, such as zh, en, 中文, English.",
           },
           libraryRoot: {
             type: "string",
             description: "Absolute path to the local book cache directory. Falls back to plugin config when omitted.",
           },
         },
-        required: ["query"],
+        anyOf: [{ required: ["query"] }, { required: ["title"] }],
       },
       execute: async (_toolCallId, params) => {
-        const result = await lookupCachedBook(params, api.pluginConfig);
+        const result = await executeToolSafely(
+          () => lookupCachedBook(params, api.pluginConfig),
+          { backend: "cache" },
+        );
         return {
           content: [
             {
@@ -209,13 +268,29 @@ const libraryFetcherPlugin = {
             type: "string",
             description: "Keyword query used to search the remote library site.",
           },
+          title: {
+            type: "string",
+            description: "Optional explicit book title. If query is omitted, title is used as the query.",
+          },
           titleHint: {
             type: "string",
             description: "Optional exact title override. When omitted, the tool uses query as the title hint.",
           },
+          author: {
+            type: "string",
+            description: "Optional explicit author name. Maps to authorHint when authorHint is omitted.",
+          },
           authorHint: {
             type: "string",
             description: "Optional author hint for better result ranking.",
+          },
+          language: {
+            type: "string",
+            description: "Optional explicit language. Maps to languageHint when languageHint is omitted.",
+          },
+          languageHint: {
+            type: "string",
+            description: "Optional language hint used to prefer matching language variants, such as zh, en, 中文, English.",
           },
           siteId: {
             type: "string",
@@ -231,10 +306,13 @@ const libraryFetcherPlugin = {
             description: "Optional search timeout override in milliseconds.",
           },
         },
-        required: ["query"],
+        anyOf: [{ required: ["query"] }, { required: ["title"] }],
       },
       execute: async (_toolCallId, params, signal) => {
-        const result = await searchBooks(params, api.pluginConfig, signal);
+        const result = await executeToolSafely(
+          () => searchBooks(params, api.pluginConfig, signal),
+          { backend: "agent-browser-search" },
+        );
         return {
           content: [
             {
@@ -262,13 +340,29 @@ const libraryFetcherPlugin = {
             type: "string",
             description: "Fallback search phrase used only when selectionToken is omitted.",
           },
+          title: {
+            type: "string",
+            description: "Fallback explicit title used only when selectionToken is omitted. If query is omitted, title is used as the query.",
+          },
           titleHint: {
             type: "string",
             description: "Fallback exact title override used only when selectionToken is omitted.",
           },
+          author: {
+            type: "string",
+            description: "Fallback explicit author used only when selectionToken is omitted. Maps to authorHint when authorHint is omitted.",
+          },
           authorHint: {
             type: "string",
             description: "Fallback author hint used only when selectionToken is omitted.",
+          },
+          language: {
+            type: "string",
+            description: "Fallback explicit language used only when selectionToken is omitted. Maps to languageHint when languageHint is omitted.",
+          },
+          languageHint: {
+            type: "string",
+            description: "Fallback language hint used only when selectionToken is omitted.",
           },
           siteId: {
             type: "string",
@@ -300,7 +394,10 @@ const libraryFetcherPlugin = {
         required: [],
       },
       execute: async (_toolCallId, params, signal) => {
-        const result = await downloadBookToLibrary(params, api.pluginConfig, signal);
+        const result = await executeToolSafely(
+          () => downloadBookToLibrary(params, api.pluginConfig, signal),
+          { backend: "agent-browser" },
+        );
         return {
           content: [
             {
@@ -324,13 +421,29 @@ const libraryFetcherPlugin = {
             type: "string",
             description: "The main user-provided book name or search phrase.",
           },
+          title: {
+            type: "string",
+            description: "Optional explicit book title. If query is omitted, title is used as the query.",
+          },
           titleHint: {
             type: "string",
             description: "Optional exact title override. When omitted, the tool uses query as the title hint.",
           },
+          author: {
+            type: "string",
+            description: "Optional explicit author name. Maps to authorHint when authorHint is omitted.",
+          },
           authorHint: {
             type: "string",
             description: "Optional author hint for better result ranking.",
+          },
+          language: {
+            type: "string",
+            description: "Optional explicit language. Maps to languageHint when languageHint is omitted.",
+          },
+          languageHint: {
+            type: "string",
+            description: "Optional language hint used to prefer matching language variants, such as zh, en, 中文, English.",
           },
           siteId: {
             type: "string",
@@ -358,27 +471,18 @@ const libraryFetcherPlugin = {
             description: "Optional 1-based result index override when multiple search results are similar.",
           }
         },
-        required: ["query"],
+        anyOf: [{ required: ["query"] }, { required: ["title"] }],
       },
       execute: async (_toolCallId, params, signal) => {
-        const result = await fetchBookToLibrary(params, api.pluginConfig, signal);
-        const lines = [
-          `${result.fromCache ? "Cache hit" : "Downloaded"}: ${result.title}`,
-          `Path: ${result.filePath}`,
-          `Backend: ${result.backend}`,
-        ];
-        if (result.author) lines.push(`Author: ${result.author}`);
-        if (result.playbookId) lines.push(`Playbook: ${result.playbookId}`);
-        if (result.sourceUrl) lines.push(`Source URL: ${result.sourceUrl}`);
-        if (result.downloadUrl) lines.push(`Download URL: ${result.downloadUrl}`);
-        if (result.llmFallbackUsed) lines.push("LLM Fallback: used");
-        if (Number.isFinite(result.elapsedSeconds)) lines.push(`Elapsed: ${result.elapsedSeconds} s`);
-        lines.push(`Library Root: ${result.libraryRoot}`);
+        const result = await executeToolSafely(
+          () => fetchBookToLibrary(params, api.pluginConfig, signal),
+          { backend: "agent-browser" },
+        );
         return {
           content: [
             {
               type: "text",
-              text: lines.join("\n"),
+              text: JSON.stringify(result, null, 2),
             },
           ],
         };
@@ -388,3 +492,11 @@ const libraryFetcherPlugin = {
 };
 
 export default libraryFetcherPlugin;
+
+async function executeToolSafely(run, fallback) {
+  try {
+    return await run();
+  } catch (error) {
+    return buildToolErrorResult(error, fallback);
+  }
+}

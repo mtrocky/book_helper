@@ -31,6 +31,10 @@ export function parsePluginConfig(value) {
   return {
     defaultLibraryRoot:
       typeof config.defaultLibraryRoot === "string" ? config.defaultLibraryRoot : undefined,
+    agentWorkspaceRoot:
+      typeof config.agentWorkspaceRoot === "string" ? config.agentWorkspaceRoot : undefined,
+    openclawMediaRoot:
+      typeof config.openclawMediaRoot === "string" ? config.openclawMediaRoot : undefined,
     playbooksDir: typeof config.playbooksDir === "string" ? config.playbooksDir : undefined,
     defaultSiteId: typeof config.defaultSiteId === "string" ? config.defaultSiteId : undefined,
     defaultPlaybookPath:
@@ -55,7 +59,7 @@ export function parsePluginConfig(value) {
   };
 }
 
-export async function describeStatus(pluginConfig, toolPolicySource = null) {
+export async function getStatusSnapshot(pluginConfig, toolPolicySource = null) {
   const config = parsePluginConfig(pluginConfig);
   const playbooksDir = path.resolve(config.playbooksDir ?? path.join(process.cwd(), "playbooks"));
   const defaultPlaybookPath = config.defaultPlaybookPath
@@ -68,22 +72,72 @@ export async function describeStatus(pluginConfig, toolPolicySource = null) {
   const libraryRoot = config.defaultLibraryRoot ?? "(unset)";
   const libraryExists =
     libraryRoot !== "(unset)" && (await exists(libraryRoot)) ? "present" : "missing";
+  const agentWorkspaceRoot = config.agentWorkspaceRoot ?? "(unset)";
+  const agentWorkspacePresent =
+    agentWorkspaceRoot !== "(unset)" && (await exists(agentWorkspaceRoot)) ? "present" : "missing";
+  const openclawMediaRoot = config.openclawMediaRoot ?? "(unset)";
+  const openclawMediaPresent =
+    openclawMediaRoot !== "(unset)" && (await exists(openclawMediaRoot)) ? "present" : "missing";
   const sessionConfigPath = path.resolve(
     config.agentBrowserSessionConfigPath ?? DEFAULT_AGENT_BROWSER_SESSION_CONFIG_PATH,
   );
-  const sessionConfigExists = (await exists(sessionConfigPath)) ? "present" : "missing";
+  const sessionConfigPresent = await exists(sessionConfigPath);
+  const sessionConfigExists = sessionConfigPresent ? "present" : "missing";
+  const sessionRuntime = sessionConfigPresent
+    ? await loadAgentBrowserSessionConfig(config)
+    : {
+        sessionConfigPath,
+        exists: false,
+        config: {},
+      };
+  const sessionName = sessionRuntime.config.sessionName ?? "(unset)";
+  const profilePath = sessionRuntime.config.profilePath ?? config.browserProfilePath ?? "(unset)";
+  const profileExists = profilePath !== "(unset)" && (await exists(profilePath)) ? "present" : "missing";
+
+  return {
+    ok: true,
+    found: true,
+    reason: "status_snapshot",
+    executionModel: "agent-browser playbook with optional LLM repair fallback",
+    toolPolicySource: toolPolicySource ?? "(not enabled)",
+    playbooksDir,
+    defaultSiteId: config.defaultSiteId ?? "",
+    defaultPlaybookPath,
+    defaultPlaybookPresent: playbookExists === "present",
+    defaultLibraryRoot: libraryRoot,
+    defaultLibraryRootPresent: libraryExists === "present",
+    agentWorkspaceRoot,
+    agentWorkspacePresent: agentWorkspacePresent === "present",
+    openclawMediaRoot,
+    openclawMediaPresent: openclawMediaPresent === "present",
+    sessionConfigPath,
+    sessionConfigPresent,
+    sessionName,
+    profilePath,
+    profilePresent: profileExists === "present",
+    agentBrowserPath: config.agentBrowserPath ?? "agent-browser",
+    llmFallbackCommand: config.llmFallbackCommand ?? "",
+  };
+}
+
+export async function describeStatus(pluginConfig, toolPolicySource = null) {
+  const snapshot = await getStatusSnapshot(pluginConfig, toolPolicySource);
 
   return [
     "Library fetcher status:",
-    "- execution model: agent-browser playbook with optional LLM repair fallback",
-    `- tool policy: ${toolPolicySource ?? "(not enabled)"}`,
-    `- playbooks dir: ${playbooksDir}`,
-    `- default site id: ${config.defaultSiteId ?? "(unset)"}`,
-    `- default playbook: ${defaultPlaybookPath} [${playbookExists}]`,
-    `- default library root: ${libraryRoot} [${libraryExists}]`,
-    `- agent-browser session config: ${sessionConfigPath} [${sessionConfigExists}]`,
-    `- agent-browser executable: ${config.agentBrowserPath ?? "agent-browser"}`,
-    `- LLM fallback command: ${config.llmFallbackCommand ?? "(unset)"}`,
+    `- execution model: ${snapshot.executionModel}`,
+    `- tool policy: ${snapshot.toolPolicySource}`,
+    `- playbooks dir: ${snapshot.playbooksDir}`,
+    `- default site id: ${snapshot.defaultSiteId || "(unset)"}`,
+    `- default playbook: ${snapshot.defaultPlaybookPath} [${snapshot.defaultPlaybookPresent ? "present" : "missing"}]`,
+    `- default library root: ${snapshot.defaultLibraryRoot} [${snapshot.defaultLibraryRootPresent ? "present" : "missing"}]`,
+    `- agent workspace root: ${snapshot.agentWorkspaceRoot} [${snapshot.agentWorkspacePresent ? "present" : "missing"}]`,
+    `- OpenClaw media root: ${snapshot.openclawMediaRoot} [${snapshot.openclawMediaPresent ? "present" : "missing"}]`,
+    `- agent-browser session config: ${snapshot.sessionConfigPath} [${snapshot.sessionConfigPresent ? "present" : "missing"}]`,
+    `- agent-browser session name: ${snapshot.sessionName}`,
+    `- browser profile path: ${snapshot.profilePath} [${snapshot.profilePresent ? "present" : "missing"}]`,
+    `- agent-browser executable: ${snapshot.agentBrowserPath}`,
+    `- LLM fallback command: ${snapshot.llmFallbackCommand || "(unset)"}`,
     "",
     "Playbook model:",
     "- each supported site lives in its own JSON playbook",
@@ -159,6 +213,25 @@ export async function resolvePlaybook({ siteId, playbookPath, pluginConfig }) {
     playbook: normalizePlaybook(parsed, resolvedPlaybookPath),
     playbookPath: resolvedPlaybookPath,
   };
+}
+
+export function getPlaybookInitUrl(playbook) {
+  const openStep = Array.isArray(playbook?.steps)
+    ? playbook.steps.find((step) => step?.type === "open" && typeof step?.url === "string")
+    : null;
+  if (!openStep?.url) {
+    return "about:blank";
+  }
+
+  try {
+    const sanitized = String(openStep.url)
+      .replace(/\{\{[^}]+\}\}/g, "test")
+      .replace(/\/s\/test(?:%20test)?/i, "/");
+    const url = new URL(sanitized);
+    return url.origin + "/";
+  } catch {
+    return openStep.url;
+  }
 }
 
 function resolvePlaybookPath({ siteId, playbookPath, pluginConfig }) {

@@ -1,42 +1,62 @@
 {
   "id": "library-fetcher",
   "name": "Library Fetcher",
-  "description": "Search a configured library website, download the target book, and reuse a local cache when available.",
+  "description": "OpenClaw book plugin with separate cache lookup, remote search, download, and login recovery flows backed by a persistent agent-browser profile.",
   "uiHints": {
     "playbooksDir": {
       "label": "Playbooks Dir",
-      "placeholder": "/absolute/path/to/playbooks",
-      "help": "Directory containing one playbook JSON per supported library site."
+      "placeholder": "/Users/lgong/Documents/Workspace/ClawBot/playbooks",
+      "help": "Directory containing one playbook JSON per supported library site. Leave this set if you want siteId-based routing."
     },
     "defaultSiteId": {
       "label": "Default Site ID",
-      "placeholder": "zlib",
-      "help": "Default site playbook id. The plugin will load <playbooksDir>/<siteId>.json."
+      "placeholder": "c-library",
+      "help": "Optional default site playbook id. For a single-site setup, prefer setting Default Playbook Path instead."
     },
     "defaultPlaybookPath": {
       "label": "Default Playbook Path",
-      "placeholder": "/absolute/path/to/playbook.json",
-      "help": "Optional explicit playbook path if you only maintain one site."
+      "placeholder": "/Users/lgong/Documents/Workspace/ClawBot/playbooks/c-library.json",
+      "help": "Recommended for this repo. Points OpenClaw directly at the single active site playbook."
     },
     "defaultLibraryRoot": {
       "label": "Library Root",
-      "placeholder": "/absolute/path/to/local-library",
-      "help": "Local cache directory where downloaded books are stored."
+      "placeholder": "/Users/lgong/Documents/Workspace/ClawBot/library_root",
+      "help": "Local cache directory where downloaded books are stored. Keep this outside git-tracked content."
+    },
+    "agentWorkspaceRoot": {
+      "label": "Agent Workspace Root",
+      "placeholder": "/Users/lgong/openclaw/workspace",
+      "help": "OpenClaw agent workspace. Downloaded books are mirrored here so the final reply can send them as Feishu attachments."
+    },
+    "openclawMediaRoot": {
+      "label": "OpenClaw Media Root",
+      "placeholder": "/Users/lgong/.openclaw/workspace",
+      "help": "Preferred outbound media root. Files mirrored here are always under OpenClaw's allowed local media directories."
     },
     "browserProfilePath": {
       "label": "Browser Profile Path",
-      "placeholder": "/absolute/path/to/browser-profile",
-      "help": "Optional persistent browser profile to preserve login state for the library site."
+      "placeholder": "/Users/lgong/Documents/Workspace/ClawBot/Runtime/profile",
+      "help": "Persistent browser profile containing cookies and login state. Keep this directory and do not commit it."
     },
     "agentBrowserSessionConfigPath": {
       "label": "Session Config Path",
-      "placeholder": "/absolute/path/to/agent-browser-session.json",
-      "help": "Optional JSON file containing sessionName/profilePath overrides for the persistent agent-browser session."
+      "placeholder": "/Users/lgong/Documents/Workspace/ClawBot/Runtime/agent-browser-session.json",
+      "help": "Recommended. JSON file containing the persistent sessionName/profilePath used by /bookfetch login and later headless runs."
+    },
+    "downloadTimeoutMs": {
+      "label": "Download Timeout (ms)",
+      "placeholder": "15000",
+      "help": "Optional timeout override for remote search and download steps. Keep this modest for debugging, raise it for large files."
+    },
+    "agentBrowserPath": {
+      "label": "agent-browser Path",
+      "placeholder": "agent-browser",
+      "help": "Executable used for browser automation. Leave as agent-browser if it is already on PATH."
     },
     "llmFallbackCommand": {
       "label": "LLM Repair Command",
       "placeholder": "/absolute/path/to/repair-agent",
-      "help": "Optional external command that receives step failure context as JSON on stdin and returns repair instructions as JSON."
+      "help": "Optional external command that receives step failure context as JSON on stdin and returns repair instructions as JSON. Not needed for the normal path."
     }
   },
   "configSchema": {
@@ -58,6 +78,14 @@
       "defaultLibraryRoot": {
         "type": "string",
         "description": "Default local library cache directory."
+      },
+      "agentWorkspaceRoot": {
+        "type": "string",
+        "description": "OpenClaw agent workspace used to create sendable attachment copies."
+      },
+      "openclawMediaRoot": {
+        "type": "string",
+        "description": "OpenClaw local media root used for outbound attachments."
       },
       "browserProfilePath": {
         "type": "string",

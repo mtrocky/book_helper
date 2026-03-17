@@ -14,9 +14,18 @@ The plugin also exposes narrower tools for OpenClaw:
 - `library_book_search`: remote search only
 - `library_book_download`: remote download only
 
+Recommended OpenClaw workflow:
+
+1. `library_cache_lookup`
+2. If not found, `library_book_search`
+3. Choose one candidate result
+4. `library_book_download(selectionToken=...)`
+
 `library_book_search` returns a stable `selectionToken` for each result. `library_book_download` should prefer that token instead of browser-specific refs such as `@e41`.
 
 When `selectionToken` is present, `library_book_download` ignores query/titleHint/authorHint/siteId/playbookPath/resultIndex and uses the token as the only selection input. It still checks the local cache first unless you explicitly pass `forceRefresh: true`.
+
+Tools also accept explicit `title` and `author` fields. If `query` is omitted, `title` becomes the query; if `authorHint` is omitted, `author` is used as the author hint. They also accept optional `language` / `languageHint`; when present, result ranking and cache matching will prefer that language. Without a language hint, the default language preference is: Chinese, then English, then Traditional Chinese, then Spanish/French.
 
 ## Files
 
@@ -60,7 +69,7 @@ npm install
 }
 ```
 
-4. If your global tool policy is restrictive, run `/bookfetch enable` once or add `library_book_fetch` to `tools.allow` or `tools.alsoAllow`.
+4. If your global tool policy is restrictive, run `/bookfetch enable` once or add `library-fetcher` to `tools.allow` or `tools.alsoAllow`. That enables the whole plugin, including `library_cache_lookup`, `library_book_search`, `library_book_download`, and the compatibility wrapper `library_book_fetch`.
 
 ## Tool input
 
@@ -79,6 +88,50 @@ npm install
 ```
 
 In normal use, `query` is the only field users need to provide. `titleHint` is optional and defaults to `query`; it only matters when you want to force a more exact title match than the raw search phrase.
+
+If the user provides both a title and an author, prefer:
+
+```json
+{
+  "title": "三体",
+  "author": "刘慈欣"
+}
+```
+
+The tool will derive the internal query/hints automatically.
+
+All tool responses now use a consistent JSON shape with:
+
+- `ok`
+- `found`
+- `reason`
+- `elapsedSeconds`
+
+Success responses then add tool-specific fields such as `results`, `selectionToken`, `filePath`, `sourceUrl`, and `downloadUrl`.
+
+Failure responses also stay JSON. They return:
+
+- `ok: false`
+- `found: false`
+- `reason`
+- `errorMessage`
+
+Current `reason` values include:
+
+- `cache_hit`
+- `cache_miss`
+- `search_results_found`
+- `no_matching_search_result`
+- `downloaded`
+- `login_session_started`
+- `profile_missing`
+- `profile_uninitialized`
+- `profile_missing_cookies`
+- `missing_query`
+- `missing_selection_input`
+- `invalid_selection_token`
+- `cache_only_miss`
+- `tool_error`
 
 ## Playbook notes
 
@@ -138,10 +191,29 @@ node ./bin/claw-library-fetch.mjs --doctor --repair '{"libraryRoot":"/abs/books"
 OpenClaw command equivalents:
 
 ```text
+/bookfetch status
+/bookfetch login
 /bookfetch doctor
 /bookfetch doctor --repair
 /bookfetch reset --confirm
 ```
+
+Structured command output is also available:
+
+```text
+/bookfetch status --json
+/bookfetch login --json
+/bookfetch doctor --json
+/bookfetch reset --confirm --json
+```
+
+`/bookfetch login` is meant for OpenClaw recovery flows. It automatically:
+
+- closes any stale `agent-browser` session
+- writes the persistent `agent-browser-session.json` file
+- launches a headed browser window using the configured `profilePath`
+
+After the user finishes logging in, close the browser session. Later search/download runs can reuse the saved profile in headless mode.
 
 To fully clear the local library root and all cache files for debugging:
 

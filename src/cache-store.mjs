@@ -2,6 +2,11 @@ import { DatabaseSync } from "node:sqlite";
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { debug } from "./debug.mjs";
+import {
+  formatPreferenceScore,
+  languagePreferenceScore,
+  normalizeLanguage,
+} from "./playbook-runtime-utils.mjs";
 
 export const CACHE_DB_FILE = ".openclaw-book-cache.sqlite";
 const LEGACY_INDEX_FILE = ".openclaw-book-cache.json";
@@ -38,8 +43,8 @@ export async function openCacheStore({ libraryRoot }) {
       async auditConsistency({ repair = false, maxIssues = 50 } = {}) {
         return auditConsistency(db, libraryRoot, { repair, maxIssues });
       },
-      async findCacheHit({ query, titleHint, authorHint }) {
-        const rows = loadCandidateRows(db, { query, titleHint, authorHint });
+      async findCacheHit({ query, titleHint, authorHint, languageHint }) {
+        const rows = loadCandidateRows(db, { query, titleHint, authorHint, languageHint });
         const candidates = [];
         const staleIds = [];
         for (const row of rows) {
@@ -65,7 +70,7 @@ export async function openCacheStore({ libraryRoot }) {
         const ranked = candidates
           .map((candidate) => ({
             candidate,
-            score: scoreCandidate(candidate, { query, titleHint, authorHint }),
+            score: scoreCandidate(candidate, { query, titleHint, authorHint, languageHint }),
           }))
           .filter((entry) => entry.score >= CACHE_MATCH_THRESHOLD)
           .sort((left, right) => right.score - left.score);
@@ -77,6 +82,12 @@ export async function openCacheStore({ libraryRoot }) {
           throw new Error(`Refusing to cache file outside libraryRoot: ${entry.filePath}`);
         }
         upsertEntrySync(db, entry);
+      },
+      recordDownloadSample(sample) {
+        insertDownloadHistorySync(db, sample);
+      },
+      estimateDownloadWindow({ playbookId, backend, expectedBytes }) {
+        return estimateDownloadWindowSync(db, { playbookId, backend, expectedBytes });
       },
       clearAll() {
         clearAllEntriesSync(db);
@@ -101,6 +112,8 @@ function ensureSchema(db) {
       title_norm TEXT NOT NULL,
       author TEXT NOT NULL DEFAULT '',
       author_norm TEXT NOT NULL DEFAULT '',
+      language TEXT NOT NULL DEFAULT '',
+      language_norm TEXT NOT NULL DEFAULT '',
       source_url TEXT NOT NULL DEFAULT '',
       download_url TEXT NOT NULL DEFAULT '',
       file_path TEXT NOT NULL UNIQUE,
@@ -111,10 +124,40 @@ function ensureSchema(db) {
       playbook_path TEXT NOT NULL DEFAULT ''
     );
 
+    CREATE TABLE IF NOT EXISTS cache_aliases (
+      entry_id TEXT NOT NULL REFERENCES cache_entries(id) ON DELETE CASCADE,
+      alias TEXT NOT NULL,
+      alias_norm TEXT NOT NULL,
+      PRIMARY KEY (entry_id, alias_norm)
+    );
+
+    CREATE TABLE IF NOT EXISTS download_history (
+      id TEXT PRIMARY KEY,
+      recorded_at TEXT NOT NULL,
+      playbook_id TEXT NOT NULL DEFAULT '',
+      backend TEXT NOT NULL DEFAULT '',
+      format TEXT NOT NULL DEFAULT '',
+      file_size_bytes INTEGER,
+      expected_bytes INTEGER,
+      predicted_seconds REAL,
+      predicted_timeout_ms INTEGER,
+      duration_seconds REAL NOT NULL
+    );
+  `);
+
+  ensureTableColumn(db, "cache_entries", "language", "TEXT NOT NULL DEFAULT ''");
+  ensureTableColumn(db, "cache_entries", "language_norm", "TEXT NOT NULL DEFAULT ''");
+  ensureTableColumn(db, "download_history", "expected_bytes", "INTEGER");
+  ensureTableColumn(db, "download_history", "predicted_seconds", "REAL");
+  ensureTableColumn(db, "download_history", "predicted_timeout_ms", "INTEGER");
+
+  db.exec(`
     CREATE INDEX IF NOT EXISTS idx_cache_entries_title_norm
       ON cache_entries(title_norm);
     CREATE INDEX IF NOT EXISTS idx_cache_entries_author_norm
       ON cache_entries(author_norm);
+    CREATE INDEX IF NOT EXISTS idx_cache_entries_language_norm
+      ON cache_entries(language_norm);
     CREATE INDEX IF NOT EXISTS idx_cache_entries_query_norm
       ON cache_entries(query_norm);
     CREATE INDEX IF NOT EXISTS idx_cache_entries_file_stem_norm
@@ -124,15 +167,11 @@ function ensureSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_cache_entries_downloaded_at
       ON cache_entries(downloaded_at DESC);
 
-    CREATE TABLE IF NOT EXISTS cache_aliases (
-      entry_id TEXT NOT NULL REFERENCES cache_entries(id) ON DELETE CASCADE,
-      alias TEXT NOT NULL,
-      alias_norm TEXT NOT NULL,
-      PRIMARY KEY (entry_id, alias_norm)
-    );
-
     CREATE INDEX IF NOT EXISTS idx_cache_aliases_alias_norm
       ON cache_aliases(alias_norm);
+
+    CREATE INDEX IF NOT EXISTS idx_download_history_playbook_backend_recorded_at
+      ON download_history(playbook_id, backend, recorded_at DESC);
   `);
 }
 
@@ -215,21 +254,22 @@ async function auditConsistency(db, libraryRoot, { repair = false, maxIssues = 5
   };
 }
 
-function loadCandidateRows(db, { query, titleHint, authorHint }) {
+function loadCandidateRows(db, { query, titleHint, authorHint, languageHint }) {
   const exactTerms = compactUnique([normalizeText(titleHint), normalizeText(query)]);
   const broadTerms = compactUnique([...exactTerms, ...tokenize(titleHint), ...tokenize(query)]);
   const authorNorm = normalizeText(authorHint);
+  const languageNorm = normalizeLanguage(languageHint);
 
   const rows = [];
   const seenIds = new Set();
-  appendUnique(rows, seenIds, runExactCandidateQuery(db, exactTerms, authorNorm));
+  appendUnique(rows, seenIds, runExactCandidateQuery(db, exactTerms, authorNorm, languageNorm));
   if (rows.length < 50) {
-    appendUnique(rows, seenIds, runBroadCandidateQuery(db, broadTerms, authorNorm));
+    appendUnique(rows, seenIds, runBroadCandidateQuery(db, broadTerms, authorNorm, languageNorm));
   }
   return rows;
 }
 
-function runExactCandidateQuery(db, exactTerms, authorNorm) {
+function runExactCandidateQuery(db, exactTerms, authorNorm, languageNorm) {
   const clauses = [];
   const params = [];
 
@@ -240,6 +280,10 @@ function runExactCandidateQuery(db, exactTerms, authorNorm) {
   if (authorNorm) {
     clauses.push("e.author_norm = ?");
     params.push(authorNorm);
+  }
+  if (languageNorm) {
+    clauses.push("e.language_norm = ?");
+    params.push(languageNorm);
   }
   if (clauses.length === 0) {
     return [];
@@ -256,7 +300,7 @@ function runExactCandidateQuery(db, exactTerms, authorNorm) {
   return db.prepare(sql).all(...params);
 }
 
-function runBroadCandidateQuery(db, broadTerms, authorNorm) {
+function runBroadCandidateQuery(db, broadTerms, authorNorm, languageNorm) {
   const clauses = [];
   const params = [];
 
@@ -268,6 +312,10 @@ function runBroadCandidateQuery(db, broadTerms, authorNorm) {
   if (authorNorm) {
     clauses.push("e.author_norm LIKE ?");
     params.push(`%${authorNorm}%`);
+  }
+  if (languageNorm) {
+    clauses.push("e.language_norm = ?");
+    params.push(languageNorm);
   }
   if (clauses.length === 0) {
     return [];
@@ -314,6 +362,7 @@ function deserializeEntry(row) {
     query: row.query,
     title: row.title,
     author: row.author,
+    language: row.language ?? "",
     sourceUrl: row.source_url,
     downloadUrl: row.download_url,
     filePath: row.file_path,
@@ -340,10 +389,12 @@ function upsertEntrySync(db, entry) {
     db.prepare(`
       INSERT INTO cache_entries (
         id, query, query_norm, title, title_norm, author, author_norm,
+        language, language_norm,
         source_url, download_url, file_path, file_stem_norm, aliases_json,
         downloaded_at, playbook_id, playbook_path
       ) VALUES (
         @id, @query, @queryNorm, @title, @titleNorm, @author, @authorNorm,
+        @language, @languageNorm,
         @sourceUrl, @downloadUrl, @filePath, @fileStemNorm, @aliasesJson,
         @downloadedAt, @playbookId, @playbookPath
       )
@@ -355,6 +406,8 @@ function upsertEntrySync(db, entry) {
       titleNorm: normalizeText(normalized.title),
       author: normalized.author,
       authorNorm: normalizeText(normalized.author),
+      language: normalized.language,
+      languageNorm: normalizeLanguage(normalized.language),
       sourceUrl: normalized.sourceUrl,
       downloadUrl: normalized.downloadUrl,
       filePath: normalized.filePath,
@@ -396,9 +449,51 @@ function removeEntryIdsSync(db, ids) {
 
 function clearAllEntriesSync(db) {
   withTransaction(db, () => {
+    db.exec("DELETE FROM download_history;");
     db.exec("DELETE FROM cache_aliases;");
     db.exec("DELETE FROM cache_entries;");
   });
+}
+
+function insertDownloadHistorySync(db, sample) {
+  const normalized = normalizeDownloadSample(sample);
+  if (!normalized) {
+    return;
+  }
+
+  db.prepare(`
+    INSERT INTO download_history (
+      id, recorded_at, playbook_id, backend, format, file_size_bytes,
+      expected_bytes, predicted_seconds, predicted_timeout_ms, duration_seconds
+    ) VALUES (
+      @id, @recordedAt, @playbookId, @backend, @format, @fileSizeBytes,
+      @expectedBytes, @predictedSeconds, @predictedTimeoutMs, @durationSeconds
+    )
+  `).run(normalized);
+}
+
+function estimateDownloadWindowSync(db, { playbookId, backend, expectedBytes }) {
+  const scopedRows = loadDownloadHistoryRows(db, { playbookId, backend });
+  if (scopedRows.length === 0) {
+    return null;
+  }
+
+  const predictedSeconds = predictDownloadSeconds(scopedRows, expectedBytes);
+  if (!Number.isFinite(predictedSeconds) || predictedSeconds <= 0) {
+    return null;
+  }
+
+  const errorBias = estimatePredictionErrorBias(scopedRows);
+  const adjustedSeconds = predictedSeconds * errorBias;
+  const timeoutSeconds = Math.max(adjustedSeconds * 1.35 + 8, adjustedSeconds + 10);
+  return {
+    predictedSeconds: roundNumber(adjustedSeconds, 2),
+    rawPredictedSeconds: roundNumber(predictedSeconds, 2),
+    errorBias: roundNumber(errorBias, 2),
+    timeoutMs: Math.round(timeoutSeconds * 1000),
+    sampleCount: scopedRows.length,
+    strategy: expectedBytes ? "size_weighted_history" : "median_history",
+  };
 }
 
 function withTransaction(db, callback) {
@@ -421,6 +516,7 @@ function normalizeEntry(entry) {
     query: String(entry.query ?? "").trim(),
     title: String(entry.title ?? "").trim(),
     author: String(entry.author ?? "").trim(),
+    language: String(entry.language ?? "").trim(),
     sourceUrl: String(entry.sourceUrl ?? "").trim(),
     downloadUrl: String(entry.downloadUrl ?? "").trim(),
     filePath: String(entry.filePath ?? "").trim(),
@@ -428,6 +524,37 @@ function normalizeEntry(entry) {
     downloadedAt: String(entry.downloadedAt ?? new Date().toISOString()),
     playbookId: String(entry.playbookId ?? "").trim(),
     playbookPath: String(entry.playbookPath ?? "").trim(),
+  };
+}
+
+function normalizeDownloadSample(sample) {
+  const durationSeconds = Number(sample?.durationSeconds);
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    return null;
+  }
+
+  const fileSizeBytes = Number(sample?.fileSizeBytes);
+  return {
+    id: String(sample?.id || cryptoRandomId()),
+    recordedAt: String(sample?.recordedAt || new Date().toISOString()),
+    playbookId: String(sample?.playbookId ?? "").trim(),
+    backend: String(sample?.backend ?? "").trim(),
+    format: String(sample?.format ?? "").trim(),
+    fileSizeBytes:
+      Number.isFinite(fileSizeBytes) && fileSizeBytes > 0 ? Math.round(fileSizeBytes) : null,
+    expectedBytes:
+      Number.isFinite(Number(sample?.expectedBytes)) && Number(sample?.expectedBytes) > 0
+        ? Math.round(Number(sample.expectedBytes))
+        : null,
+    predictedSeconds:
+      Number.isFinite(Number(sample?.predictedSeconds)) && Number(sample?.predictedSeconds) > 0
+        ? Number(sample.predictedSeconds)
+        : null,
+    predictedTimeoutMs:
+      Number.isFinite(Number(sample?.predictedTimeoutMs)) && Number(sample?.predictedTimeoutMs) > 0
+        ? Math.round(Number(sample.predictedTimeoutMs))
+        : null,
+    durationSeconds,
   };
 }
 
@@ -450,6 +577,12 @@ function shouldReplaceCacheEntry(current, entry) {
   const entryTitle = normalizeText(entry.title);
   const currentAuthor = normalizeText(current.author);
   const entryAuthor = normalizeText(entry.author);
+  const currentLanguage = normalizeLanguage(current.language);
+  const entryLanguage = normalizeLanguage(entry.language);
+
+  if (currentLanguage && entryLanguage && currentLanguage !== entryLanguage) {
+    return false;
+  }
 
   if (currentTitle && entryTitle && currentTitle === entryTitle) {
     if (!currentAuthor || !entryAuthor || currentAuthor === entryAuthor) {
@@ -470,7 +603,79 @@ function shouldReplaceCacheEntry(current, entry) {
   return false;
 }
 
-function scoreCandidate(candidate, { query, titleHint, authorHint }) {
+function loadDownloadHistoryRows(db, { playbookId, backend }) {
+  const byBackend = db.prepare(`
+    SELECT duration_seconds, file_size_bytes, expected_bytes, predicted_seconds, predicted_timeout_ms
+    FROM download_history
+    WHERE playbook_id = ? AND backend = ?
+    ORDER BY recorded_at DESC
+    LIMIT 30
+  `).all(String(playbookId ?? ""), String(backend ?? ""));
+
+  if (byBackend.length >= 3) {
+    return byBackend;
+  }
+
+  return db.prepare(`
+    SELECT duration_seconds, file_size_bytes, expected_bytes, predicted_seconds, predicted_timeout_ms
+    FROM download_history
+    WHERE playbook_id = ?
+    ORDER BY recorded_at DESC
+    LIMIT 30
+  `).all(String(playbookId ?? ""));
+}
+
+function predictDownloadSeconds(rows, expectedBytes) {
+  const durations = rows
+    .map((row) => Number(row.duration_seconds))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  if (durations.length === 0) {
+    return null;
+  }
+
+  const expectedMb =
+    Number.isFinite(expectedBytes) && expectedBytes > 0 ? expectedBytes / (1024 * 1024) : null;
+  const sizedRows = rows
+    .map((row) => ({
+      durationSeconds: Number(row.duration_seconds),
+      sizeMb:
+        Number.isFinite(Number(row.file_size_bytes)) && Number(row.file_size_bytes) > 0
+          ? Number(row.file_size_bytes) / (1024 * 1024)
+          : null,
+    }))
+    .filter(
+      (row) =>
+        Number.isFinite(row.durationSeconds) &&
+        row.durationSeconds > 0 &&
+        Number.isFinite(row.sizeMb) &&
+        row.sizeMb > 0,
+    );
+
+  if (expectedMb && expectedMb > 0 && sizedRows.length >= 3) {
+    const secondsPerMb = median(
+      sizedRows.map((row) => row.durationSeconds / Math.max(row.sizeMb, 0.1)),
+    );
+    return secondsPerMb * expectedMb;
+  }
+
+  return median(durations);
+}
+
+function estimatePredictionErrorBias(rows) {
+  const ratios = rows
+    .map((row) => {
+      const predicted = Number(row.predicted_seconds);
+      const actual = Number(row.duration_seconds);
+      if (!Number.isFinite(predicted) || predicted <= 0) return null;
+      if (!Number.isFinite(actual) || actual <= 0) return null;
+      return Math.min(2.5, Math.max(0.6, actual / predicted));
+    })
+    .filter((value) => Number.isFinite(value));
+
+  return ratios.length > 0 ? median(ratios) : 1;
+}
+
+function scoreCandidate(candidate, { query, titleHint, authorHint, languageHint }) {
   const haystacks = compactUnique([
     candidate.title,
     candidate.author,
@@ -483,10 +688,13 @@ function scoreCandidate(candidate, { query, titleHint, authorHint }) {
   const queryNorm = normalizeText(query);
   const titleHintNorm = normalizeText(titleHint);
   const authorHintNorm = normalizeText(authorHint);
+  const candidateLanguageNorm = normalizeLanguage(candidate.language);
+  const languageHintNorm = normalizeLanguage(languageHint);
 
   let score = 0;
   if (titleHintNorm && title === titleHintNorm) score += 120;
   if (authorHintNorm && author.includes(authorHintNorm)) score += 45;
+  score += languagePreferenceScore(candidateLanguageNorm, languageHintNorm);
   if (title.includes(queryNorm)) score += 100;
   if (haystacks.some((entry) => entry.includes(queryNorm))) score += 70;
   score += tokenize(query).filter((token) => haystacks.some((entry) => entry.includes(token))).length * 14;
@@ -498,8 +706,8 @@ function extensionScore(filePath) {
   const extension = path.extname(filePath || "").toLowerCase();
   if (!extension) return 0;
   if (extension === ".bin") return -25;
-  if (PREFERRED_EXTENSIONS.has(extension)) return 10;
-  return 0;
+  if (!PREFERRED_EXTENSIONS.has(extension)) return 0;
+  return formatPreferenceScore(extension, "");
 }
 
 function parseAliases(raw) {
@@ -527,6 +735,35 @@ function normalizeText(value) {
     .normalize("NFKD")
     .replace(/[^\p{Letter}\p{Number}]+/gu, " ")
     .trim();
+}
+
+function median(values) {
+  const sorted = values
+    .filter((value) => Number.isFinite(value))
+    .sort((left, right) => left - right);
+  if (sorted.length === 0) return null;
+  const middle = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) {
+    return sorted[middle];
+  }
+  return (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function roundNumber(value, digits) {
+  const factor = 10 ** digits;
+  return Math.round(value * factor) / factor;
+}
+
+function cryptoRandomId() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function ensureTableColumn(db, tableName, columnName, columnSpec) {
+  const rows = db.prepare(`PRAGMA table_info(${tableName})`).all();
+  if (rows.some((row) => row?.name === columnName)) {
+    return;
+  }
+  db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnSpec};`);
 }
 
 function tokenize(value) {
