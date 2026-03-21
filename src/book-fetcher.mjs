@@ -164,7 +164,6 @@ export async function submitLibraryJob(rawParams, rawPluginConfig) {
   });
 
   const jobId = randomUUID();
-  const queueSnapshot = getRemoteQueueSnapshot();
   const createdAt = new Date().toISOString();
   const job = {
     id: jobId,
@@ -206,6 +205,17 @@ export async function submitLibraryJob(rawParams, rawPluginConfig) {
     });
   }
 
+  let resolveQueueReady;
+  const queueReady = new Promise((resolve) => {
+    resolveQueueReady = resolve;
+  });
+  let queueReadyResolved = false;
+  const markQueueReady = () => {
+    if (queueReadyResolved) return;
+    queueReadyResolved = true;
+    resolveQueueReady();
+  };
+
   fetchBookToLibrary(rawParams, rawPluginConfig, undefined, {
     onRemoteQueueEvent(event) {
       if (!event || typeof event !== "object") return;
@@ -227,6 +237,9 @@ export async function submitLibraryJob(rawParams, rawPluginConfig) {
         job.status = "running";
       }
       job.updatedAt = new Date().toISOString();
+      if (event.type === "queued" || event.type === "started") {
+        markQueueReady();
+      }
       void persistJob(libraryRoot, job);
     },
   })
@@ -237,26 +250,29 @@ export async function submitLibraryJob(rawParams, rawPluginConfig) {
         ...result,
         jobId,
       };
+      markQueueReady();
       return persistJob(libraryRoot, job);
     })
     .catch((error) => {
       job.status = "failed";
       job.updatedAt = new Date().toISOString();
       job.error = buildToolErrorResult(error, { jobId });
+      markQueueReady();
       return persistJob(libraryRoot, job);
     });
+
+  await Promise.race([queueReady, delay(250)]);
 
   return buildToolResult({
     ok: true,
     found: true,
     reason: "job_submitted",
     jobId,
-    status: "queued",
+    status: job.status === "submitted" ? "queued" : job.status,
     fromCache: false,
     queueStatus: {
-      initialPosition: job.queueInitialPosition || queueSnapshot.running + queueSnapshot.queued + 1,
-      tasksAheadAtEnqueue:
-        job.queueTasksAheadAtEnqueue || queueSnapshot.running + queueSnapshot.queued,
+      initialPosition: job.queueInitialPosition || null,
+      tasksAheadAtEnqueue: job.queueTasksAheadAtEnqueue || 0,
     },
     resultPreview: null,
   });
@@ -1140,6 +1156,10 @@ async function resolveOpenClawMediaRoot(pluginConfig) {
 
 function roundElapsedSeconds(startedAt) {
   return Math.round(((Date.now() - startedAt) / 1000) * 100) / 100;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function formatSearchResult(entry, { params, playbookId, playbookPath, resultIndex, estimate }) {
