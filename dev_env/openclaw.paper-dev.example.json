@@ -1,0 +1,118 @@
+{
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "custom-dashscope-aliyuncs-com": {
+        "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "apiKey": "REPLACE_WITH_MODEL_API_KEY",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "qwen3.5-flash",
+            "name": "qwen3.5-flash (Custom Provider)",
+            "reasoning": false,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 16000,
+            "maxTokens": 4096
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "custom-dashscope-aliyuncs-com/qwen3.5-flash"
+      },
+      "workspace": "/Users/lgong/openclaw/workspace",
+      "compaction": {
+        "mode": "safeguard"
+      }
+    }
+  },
+  "tools": {
+    "profile": "coding",
+    "alsoAllow": [
+      "library_cache_lookup",
+      "library_book_search",
+      "library_book_download",
+      "library_book_fetch",
+      "library_job_submit",
+      "library_job_status",
+      "library_job_result"
+    ],
+    "web": {
+      "search": {
+        "enabled": false
+      }
+    }
+  },
+  "bindings": [
+    {
+      "agentId": "main",
+      "match": {
+        "channel": "feishu",
+        "accountId": "paper-dev"
+      }
+    }
+  ],
+  "session": {
+    "dmScope": "per-channel-peer"
+  },
+  "channels": {
+    "feishu": {
+      "enabled": true,
+      "appId": "REPLACE_WITH_TEST_FEISHU_APP_ID",
+      "appSecret": "REPLACE_WITH_TEST_FEISHU_APP_SECRET",
+      "connectionMode": "websocket",
+      "domain": "feishu",
+      "groupPolicy": "closed",
+      "dmPolicy": "open",
+      "allowFrom": [
+        "*"
+      ]
+    }
+  },
+  "gateway": {
+    "port": 18790,
+    "mode": "local",
+    "bind": "loopback"
+  },
+  "plugins": {
+    "allow": [
+      "feishu",
+      "library-fetcher"
+    ],
+    "load": {
+      "paths": [
+        "/opt/homebrew/lib/node_modules/openclaw/extensions/feishu",
+        "/Users/lgong/Documents/Workspace/ClawBot"
+      ]
+    },
+    "entries": {
+      "feishu": {
+        "enabled": true
+      },
+      "library-fetcher": {
+        "enabled": true,
+        "config": {
+          "defaultPlaybookPath": "/Users/lgong/Documents/Workspace/ClawBot/playbooks/c-library.json",
+          "defaultLibraryRoot": "/Users/lgong/Documents/Workspace/ClawBot/dev_env/library",
+          "openclawMediaRoot": "/Users/lgong/Documents/Workspace/ClawBot/dev_env/media",
+          "browserProfilePath": "/Users/lgong/Documents/Workspace/ClawBot/dev_env/runtime/profile",
+          "agentBrowserSessionConfigPath": "/Users/lgong/Documents/Workspace/ClawBot/dev_env/runtime/agent-browser-session.json",
+          "downloadTimeoutMs": 15000,
+          "agentBrowserPath": "agent-browser"
+        }
+      }
+    }
+  }
+}

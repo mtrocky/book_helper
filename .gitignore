@@ -1,4 +1,7 @@
 node_modules/
 library_root/
 Runtime/
-
+dev_env/runtime/
+dev_env/library/
+dev_env/media/
+dev_env/*.local.json

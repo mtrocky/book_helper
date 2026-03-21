@@ -82,6 +82,24 @@ npm install
 
 4. If your global tool policy is restrictive, run `/bookfetch enable` once or add `library-fetcher` to `tools.allow` or `tools.alsoAllow`. That enables the whole plugin, including `library_cache_lookup`, `library_book_search`, `library_book_download`, and the compatibility wrapper `library_book_fetch`.
 
+## Isolated Dev Environment
+
+If you are developing a second provider, keep it off the production bot by using a separate OpenClaw config and separate plugin state.
+
+- Example config template: `/Users/lgong/Documents/Workspace/ClawBot/dev_env/openclaw.paper-dev.example.json`
+- Dev environment notes: `/Users/lgong/Documents/Workspace/ClawBot/dev_env/README.md`
+
+The minimum isolation boundary is:
+
+- a separate Feishu bot/app
+- a separate OpenClaw config file
+- a separate library root
+- a separate browser profile
+- a separate `agent-browser-session.json`
+- optionally a separate attachment/media root
+
+This lets you run paper-library work on a second gateway port without touching the production book bot.
+
 ## Tool input
 
 ```json
