@@ -13,6 +13,14 @@ import { debug, info } from "./debug.mjs";
 import { supportsPlaywrightZLibrary } from "./playwright-zlibrary.mjs";
 import { estimateDownloadTimeoutMs } from "./playbook-runtime-utils.mjs";
 import {
+  configureRemoteQueue,
+  enqueueRemoteTask,
+  getRemoteQueueSnapshot,
+  getRemoteTaskState,
+} from "./remote-queue.mjs";
+import {
+  DEFAULT_BROWSER_PROFILE_PATH,
+  DEFAULT_LIBRARY_ROOT,
   describeStatus as describePlaybookStatus,
   getStatusSnapshot as getPlaybookStatusSnapshot,
   getPlaybookInitUrl,
@@ -25,16 +33,26 @@ export const DEFAULT_TOOL_NAME = "library_book_fetch";
 export const CACHE_LOOKUP_TOOL_NAME = "library_cache_lookup";
 export const SEARCH_TOOL_NAME = "library_book_search";
 export const DOWNLOAD_TOOL_NAME = "library_book_download";
+export const JOB_SUBMIT_TOOL_NAME = "library_job_submit";
+export const JOB_STATUS_TOOL_NAME = "library_job_status";
+export const JOB_RESULT_TOOL_NAME = "library_job_result";
 export const PLUGIN_ID = "library-fetcher";
 export const TOOL_GROUP = "group:plugins";
 const TOOL_NAMES = [
   CACHE_LOOKUP_TOOL_NAME,
   SEARCH_TOOL_NAME,
   DOWNLOAD_TOOL_NAME,
+  JOB_SUBMIT_TOOL_NAME,
+  JOB_STATUS_TOOL_NAME,
+  JOB_RESULT_TOOL_NAME,
   DEFAULT_TOOL_NAME,
 ];
 
 const DEFAULT_DOWNLOAD_TIMEOUT_MS = 120000;
+const MAX_STORED_JOBS = 200;
+const JOB_RETENTION_MS = 24 * 60 * 60 * 1000;
+const jobStore = new Map();
+const recoveredJobRoots = new Set();
 
 export { parsePluginConfig };
 
@@ -92,19 +110,262 @@ export function withToolEnabled(config) {
 }
 
 export async function describeStatus(pluginConfig, toolPolicySource = null) {
-  return describePlaybookStatus(pluginConfig, toolPolicySource);
+  const snapshot = await getStatusSnapshot(pluginConfig, toolPolicySource);
+  return [
+    await describePlaybookStatus(pluginConfig, toolPolicySource),
+    "",
+    "Remote queue:",
+    `- concurrency: ${snapshot.remoteQueue.concurrency}`,
+    `- max queued: ${snapshot.remoteQueue.maxQueued}`,
+    `- running: ${snapshot.remoteQueue.running}`,
+    `- queued: ${snapshot.remoteQueue.queued}`,
+    "",
+    "Jobs:",
+    `- total tracked: ${snapshot.jobs.total}`,
+    `- queued: ${snapshot.jobs.queued}`,
+    `- running: ${snapshot.jobs.running}`,
+    `- completed: ${snapshot.jobs.completed}`,
+    `- failed: ${snapshot.jobs.failed}`,
+  ].join("\n");
 }
 
 export async function getStatusSnapshot(pluginConfig, toolPolicySource = null) {
-  return getPlaybookStatusSnapshot(pluginConfig, toolPolicySource);
+  const config = parsePluginConfig(pluginConfig);
+  configureRemoteQueue({
+    concurrency: config.remoteQueueConcurrency,
+    maxQueued: config.remoteQueueMaxQueued,
+  });
+  const libraryRoot = path.resolve(config.defaultLibraryRoot ?? DEFAULT_LIBRARY_ROOT);
+  const persistedJobCounts = await withPersistentJobStore(libraryRoot, async (cacheStore) => {
+    await ensurePersistentJobsRecovered(cacheStore, libraryRoot);
+    cacheStore.pruneJobs({ maxStored: MAX_STORED_JOBS, retentionMs: JOB_RETENTION_MS });
+    return cacheStore.getJobCounts();
+  });
+  return {
+    ...(await getPlaybookStatusSnapshot(pluginConfig, toolPolicySource)),
+    remoteQueue: getRemoteQueueSnapshot(),
+    jobs: persistedJobCounts,
+  };
+}
+
+export async function submitLibraryJob(rawParams, rawPluginConfig) {
+  const params = validateParams(rawParams);
+  const pluginConfig = parsePluginConfig(rawPluginConfig);
+  configureRemoteQueue({
+    concurrency: pluginConfig.remoteQueueConcurrency,
+    maxQueued: pluginConfig.remoteQueueMaxQueued,
+  });
+  const libraryRoot = path.resolve(
+    params.libraryRoot ?? pluginConfig.defaultLibraryRoot ?? DEFAULT_LIBRARY_ROOT,
+  );
+  await withPersistentJobStore(libraryRoot, async (cacheStore) => {
+    await ensurePersistentJobsRecovered(cacheStore, libraryRoot);
+    cacheStore.pruneJobs({ maxStored: MAX_STORED_JOBS, retentionMs: JOB_RETENTION_MS });
+  });
+
+  const jobId = randomUUID();
+  const queueSnapshot = getRemoteQueueSnapshot();
+  const createdAt = new Date().toISOString();
+  const job = {
+    id: jobId,
+    kind: "fetch",
+    status: "submitted",
+    createdAt,
+    updatedAt: createdAt,
+    params: sanitizeJobParams(params),
+    queueTaskId: "",
+    queueKind: "",
+    queueInitialPosition: 0,
+    queueTasksAheadAtEnqueue: 0,
+    result: null,
+    error: null,
+  };
+  jobStore.set(jobId, job);
+  await persistJob(libraryRoot, job);
+
+  const cacheProbe = params.forceRefresh
+    ? null
+    : await lookupCachedBook(rawParams, rawPluginConfig).catch(() => null);
+  if (cacheProbe?.ok && cacheProbe?.found) {
+    job.status = "completed";
+    job.updatedAt = new Date().toISOString();
+    job.result = {
+      ...cacheProbe,
+      jobId,
+    };
+    await persistJob(libraryRoot, job);
+    return buildToolResult({
+      ok: true,
+      found: true,
+      reason: "job_submitted",
+      jobId,
+      status: job.status,
+      fromCache: true,
+      queueStatus: null,
+      resultPreview: summarizeJobResult(job.result),
+    });
+  }
+
+  fetchBookToLibrary(rawParams, rawPluginConfig, undefined, {
+    onRemoteQueueEvent(event) {
+      if (!event || typeof event !== "object") return;
+      if (event.taskId) {
+        job.queueTaskId = event.taskId;
+      }
+      if (event.kind) {
+        job.queueKind = event.kind;
+      }
+      if (Number.isInteger(event.initialPosition)) {
+        job.queueInitialPosition = event.initialPosition;
+      }
+      if (Number.isInteger(event.tasksAhead)) {
+        job.queueTasksAheadAtEnqueue = event.tasksAhead;
+      }
+      if (event.type === "queued") {
+        job.status = "queued";
+      } else if (event.type === "started") {
+        job.status = "running";
+      }
+      job.updatedAt = new Date().toISOString();
+      void persistJob(libraryRoot, job);
+    },
+  })
+    .then((result) => {
+      job.status = "completed";
+      job.updatedAt = new Date().toISOString();
+      job.result = {
+        ...result,
+        jobId,
+      };
+      return persistJob(libraryRoot, job);
+    })
+    .catch((error) => {
+      job.status = "failed";
+      job.updatedAt = new Date().toISOString();
+      job.error = buildToolErrorResult(error, { jobId });
+      return persistJob(libraryRoot, job);
+    });
+
+  return buildToolResult({
+    ok: true,
+    found: true,
+    reason: "job_submitted",
+    jobId,
+    status: "queued",
+    fromCache: false,
+    queueStatus: {
+      initialPosition: job.queueInitialPosition || queueSnapshot.running + queueSnapshot.queued + 1,
+      tasksAheadAtEnqueue:
+        job.queueTasksAheadAtEnqueue || queueSnapshot.running + queueSnapshot.queued,
+    },
+    resultPreview: null,
+  });
+}
+
+export async function getLibraryJobStatus(rawParams, rawPluginConfig) {
+  const jobId = typeof rawParams?.jobId === "string" ? rawParams.jobId.trim() : "";
+  if (!jobId) {
+    throw new Error("jobId is required.");
+  }
+  const job = await loadJob(rawParams, rawPluginConfig, jobId);
+  if (!job) {
+    throw new Error(`Unknown jobId: ${jobId}`);
+  }
+
+  const remoteTask = job.queueTaskId ? getRemoteTaskState(job.queueTaskId) : null;
+  const status =
+    job.status === "completed" || job.status === "failed"
+      ? job.status
+      : remoteTask?.state === "running"
+      ? "running"
+      : remoteTask?.state === "queued"
+      ? "queued"
+      : job.status;
+
+  return buildToolResult({
+    ok: true,
+    found: true,
+    reason: "job_status",
+    jobId,
+    status,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    params: job.params,
+    queueStatus: remoteTask
+      ? {
+          currentPosition: remoteTask.currentPosition,
+          tasksAhead: remoteTask.tasksAhead,
+          waitSeconds: remoteTask.waitSeconds,
+          runningSeconds: remoteTask.runningSeconds,
+          initialPosition: job.queueInitialPosition || null,
+          tasksAheadAtEnqueue: job.queueTasksAheadAtEnqueue || null,
+        }
+      : job.queueTaskId
+      ? {
+          currentPosition: null,
+          tasksAhead: null,
+          waitSeconds: null,
+          runningSeconds: null,
+          initialPosition: job.queueInitialPosition || null,
+          tasksAheadAtEnqueue: job.queueTasksAheadAtEnqueue || null,
+        }
+      : null,
+    resultPreview: job.result ? summarizeJobResult(job.result) : null,
+    error: job.error
+      ? {
+          reason: job.error.reason ?? "job_failed",
+          errorMessage: job.error.errorMessage ?? "Job failed.",
+        }
+      : null,
+  });
+}
+
+export async function getLibraryJobResult(rawParams, rawPluginConfig) {
+  const jobId = typeof rawParams?.jobId === "string" ? rawParams.jobId.trim() : "";
+  if (!jobId) {
+    throw new Error("jobId is required.");
+  }
+  const job = await loadJob(rawParams, rawPluginConfig, jobId);
+  if (!job) {
+    throw new Error(`Unknown jobId: ${jobId}`);
+  }
+  if (job.status === "failed") {
+    return buildToolResult({
+      ...job.error,
+      jobId,
+      status: "failed",
+      reason: job.error?.reason ?? "job_failed",
+    });
+  }
+  if (job.status !== "completed" || !job.result) {
+    return buildToolResult({
+      ok: true,
+      found: false,
+      reason: "job_not_ready",
+      jobId,
+      status: job.status,
+    });
+  }
+  return buildToolResult({
+    ...job.result,
+    ok: true,
+    found: true,
+    reason: "job_result_ready",
+    jobId,
+    status: "completed",
+  });
 }
 
 export async function auditLibraryCache(rawParams, rawPluginConfig) {
   const params =
     rawParams && typeof rawParams === "object" && !Array.isArray(rawParams) ? rawParams : {};
   const pluginConfig = parsePluginConfig(rawPluginConfig);
+  configureRemoteQueue({
+    concurrency: pluginConfig.remoteQueueConcurrency,
+    maxQueued: pluginConfig.remoteQueueMaxQueued,
+  });
   const libraryRoot = path.resolve(
-    params.libraryRoot ?? pluginConfig.defaultLibraryRoot ?? path.join(process.cwd(), "library"),
+    params.libraryRoot ?? pluginConfig.defaultLibraryRoot ?? DEFAULT_LIBRARY_ROOT,
   );
   const repair = Boolean(params.repair);
 
@@ -143,7 +404,7 @@ export async function resetLibraryCache(rawParams, rawPluginConfig) {
 
   const pluginConfig = parsePluginConfig(rawPluginConfig);
   const libraryRoot = path.resolve(
-    params.libraryRoot ?? pluginConfig.defaultLibraryRoot ?? path.join(process.cwd(), "library"),
+    params.libraryRoot ?? pluginConfig.defaultLibraryRoot ?? DEFAULT_LIBRARY_ROOT,
   );
 
   await mkdir(libraryRoot, { recursive: true });
@@ -190,7 +451,7 @@ export async function startLibraryLogin(rawParams, rawPluginConfig) {
       sessionRuntime.config.profilePath ||
       pluginConfig.browserProfilePath ||
       playbook.browser.profilePath ||
-      path.join(process.cwd(), "Runtime", "profile"),
+      DEFAULT_BROWSER_PROFILE_PATH,
   );
   const sessionConfigPath = sessionRuntime.sessionConfigPath;
   const initUrl = getPlaybookInitUrl(playbook);
@@ -239,7 +500,7 @@ export async function lookupCachedBook(rawParams, rawPluginConfig) {
   const params = validateParams(rawParams);
   const pluginConfig = parsePluginConfig(rawPluginConfig);
   const libraryRoot = path.resolve(
-    params.libraryRoot ?? pluginConfig.defaultLibraryRoot ?? path.join(process.cwd(), "library"),
+    params.libraryRoot ?? pluginConfig.defaultLibraryRoot ?? DEFAULT_LIBRARY_ROOT,
   );
 
   await mkdir(libraryRoot, { recursive: true });
@@ -311,8 +572,12 @@ export async function searchBooks(rawParams, rawPluginConfig, signal) {
   const startedAt = Date.now();
   const params = validateParams(rawParams);
   const pluginConfig = parsePluginConfig(rawPluginConfig);
+  configureRemoteQueue({
+    concurrency: pluginConfig.remoteQueueConcurrency,
+    maxQueued: pluginConfig.remoteQueueMaxQueued,
+  });
   const libraryRoot = path.resolve(
-    params.libraryRoot ?? pluginConfig.defaultLibraryRoot ?? path.join(process.cwd(), "library"),
+    params.libraryRoot ?? pluginConfig.defaultLibraryRoot ?? DEFAULT_LIBRARY_ROOT,
   );
   const { playbook, playbookPath } = await resolvePlaybook({
     siteId: params.siteId,
@@ -339,14 +604,26 @@ export async function searchBooks(rawParams, rawPluginConfig, signal) {
 
   const cacheStore = await openCacheStore({ libraryRoot });
   try {
-    const result = await searchAgentBrowserPlaybook({
-      params,
-      pluginConfig,
-      playbook,
-      tempRoot,
-      downloadTimeoutMs,
-      signal,
-    });
+    const queued = await enqueueRemoteTask(
+      {
+        kind: "remote-search",
+        signal,
+        meta: {
+          query: params.query,
+          playbookId: playbook.id,
+        },
+      },
+      () =>
+        searchAgentBrowserPlaybook({
+          params,
+          pluginConfig,
+          playbook,
+          tempRoot,
+          downloadTimeoutMs,
+          signal,
+        }),
+    );
+    const result = queued.value;
     const backend = inferDownloadBackend(playbook);
     const results = (result.results ?? [])
       .map((entry, index) =>
@@ -393,6 +670,7 @@ export async function searchBooks(rawParams, rawPluginConfig, signal) {
       currentUrl: result.currentUrl,
       currentTitle: result.currentTitle,
       llmFallbackUsed: result.llmFallbackUsed,
+      queueStatus: queued.queueStatus,
       userStatus: results[0]
         ? buildUserStatus({
             stage: "found",
@@ -445,10 +723,14 @@ export async function downloadBookToLibrary(rawParams, rawPluginConfig, signal) 
   );
 }
 
-export async function fetchBookToLibrary(rawParams, rawPluginConfig, signal) {
+export async function fetchBookToLibrary(rawParams, rawPluginConfig, signal, hooks = {}) {
   const startedAt = Date.now();
   const params = validateParams(rawParams);
   const pluginConfig = parsePluginConfig(rawPluginConfig);
+  configureRemoteQueue({
+    concurrency: pluginConfig.remoteQueueConcurrency,
+    maxQueued: pluginConfig.remoteQueueMaxQueued,
+  });
   debug("starting fetch", {
     query: params.query,
     titleHint: params.titleHint,
@@ -463,7 +745,7 @@ export async function fetchBookToLibrary(rawParams, rawPluginConfig, signal) {
     keepSessionOnError: params.keepSessionOnError,
   });
   const libraryRoot = path.resolve(
-    params.libraryRoot ?? pluginConfig.defaultLibraryRoot ?? path.join(process.cwd(), "library"),
+    params.libraryRoot ?? pluginConfig.defaultLibraryRoot ?? DEFAULT_LIBRARY_ROOT,
   );
   const downloadTimeoutMs = params.timeoutMs ?? pluginConfig.downloadTimeoutMs ?? DEFAULT_DOWNLOAD_TIMEOUT_MS;
   info("book fetch started", {
@@ -569,15 +851,28 @@ export async function fetchBookToLibrary(rawParams, rawPluginConfig, signal) {
           cacheStore.estimateDownloadWindow({ playbookId, backend, expectedBytes }),
         recordSample: (sample) => cacheStore.recordDownloadSample(sample),
       };
-      const download = await executeAgentBrowserPlaybook({
-        params,
-        pluginConfig,
-        playbook,
-        tempRoot,
-        downloadTimeoutMs,
-        downloadTimingModel,
-        signal,
-      });
+      const queued = await enqueueRemoteTask(
+        {
+          kind: "remote-fetch",
+          signal,
+          meta: {
+            query: params.query,
+            playbookId: playbook.id,
+          },
+          onEvent: hooks.onRemoteQueueEvent,
+        },
+        () =>
+          executeAgentBrowserPlaybook({
+            params,
+            pluginConfig,
+            playbook,
+            tempRoot,
+            downloadTimeoutMs,
+            downloadTimingModel,
+            signal,
+          }),
+      );
+      const download = queued.value;
       debug("playbook execution finished", download);
 
       const finalPath = await moveToLibrary({
@@ -643,6 +938,7 @@ export async function fetchBookToLibrary(rawParams, rawPluginConfig, signal) {
         downloadUrl: download.downloadUrl,
         playbookId: playbook.id,
         llmFallbackUsed: download.llmFallbackUsed,
+        queueStatus: queued.queueStatus,
         ...shareInfo,
         userStatus: buildUserStatus({
           stage: "download_completed",
@@ -833,24 +1129,6 @@ async function buildShareInfo(filePath, pluginConfig) {
   }
 }
 
-async function resolveAgentWorkspaceRoot(pluginConfig) {
-  const configured = pluginConfig.agentWorkspaceRoot?.trim();
-  if (configured) {
-    const resolved = path.resolve(configured);
-    if (await exists(resolved)) return resolved;
-  }
-
-  for (const envName of ["OPENCLAW_AGENT_WORKSPACE", "OPENCLAW_WORKSPACE"]) {
-    const value = process.env[envName]?.trim();
-    if (!value) continue;
-    const resolved = path.resolve(value);
-    if (await exists(resolved)) return resolved;
-  }
-
-  const fallback = path.join(os.homedir(), "openclaw", "workspace");
-  return (await exists(fallback)) ? fallback : null;
-}
-
 async function resolveOpenClawMediaRoot(pluginConfig) {
   const configured = pluginConfig.openclawMediaRoot?.trim();
   if (configured) {
@@ -1031,6 +1309,99 @@ function sanitizeExternalUrl(value) {
   return raw;
 }
 
+function sanitizeJobParams(params) {
+  return {
+    query: params.query,
+    titleHint: params.titleHint,
+    authorHint: params.authorHint,
+    languageHint: params.languageHint,
+    libraryRoot: params.libraryRoot ?? "",
+    siteId: params.siteId ?? "",
+    playbookPath: params.playbookPath ?? "",
+    forceRefresh: Boolean(params.forceRefresh),
+  };
+}
+
+async function loadJob(rawParams, rawPluginConfig, jobId) {
+  const params =
+    rawParams && typeof rawParams === "object" && !Array.isArray(rawParams) ? rawParams : {};
+  const libraryRoot = resolveJobLibraryRoot(params, rawPluginConfig);
+  return withPersistentJobStore(libraryRoot, async (cacheStore) => {
+    await ensurePersistentJobsRecovered(cacheStore, libraryRoot);
+    cacheStore.pruneJobs({ maxStored: MAX_STORED_JOBS, retentionMs: JOB_RETENTION_MS });
+    const persisted = cacheStore.getJob(jobId);
+    if (persisted) {
+      jobStore.set(jobId, persisted);
+    }
+    return persisted ?? jobStore.get(jobId) ?? null;
+  });
+}
+
+async function persistJob(libraryRoot, job) {
+  jobStore.set(job.id, job);
+  return withPersistentJobStore(libraryRoot, async (cacheStore) => {
+    cacheStore.upsertJob(job);
+  });
+}
+
+async function withPersistentJobStore(libraryRoot, fn) {
+  await mkdir(libraryRoot, { recursive: true });
+  const cacheStore = await openCacheStore({ libraryRoot });
+  try {
+    return await fn(cacheStore);
+  } finally {
+    cacheStore.close();
+  }
+}
+
+async function ensurePersistentJobsRecovered(cacheStore, libraryRoot) {
+  if (recoveredJobRoots.has(libraryRoot)) {
+    return;
+  }
+  cacheStore.recoverInterruptedJobs();
+  recoveredJobRoots.add(libraryRoot);
+}
+
+function resolveJobLibraryRoot(params, rawPluginConfig) {
+  const pluginConfig = parsePluginConfig(rawPluginConfig);
+  const raw = typeof params?.libraryRoot === "string" && params.libraryRoot.trim()
+    ? params.libraryRoot
+    : undefined;
+  return path.resolve(raw ?? pluginConfig.defaultLibraryRoot ?? DEFAULT_LIBRARY_ROOT);
+}
+
+function summarizeJobResult(result) {
+  if (!result || typeof result !== "object") {
+    return null;
+  }
+  return {
+    title: result.title ?? "",
+    author: result.author ?? "",
+    filePath: result.filePath ?? "",
+    fromCache: Boolean(result.fromCache) || result.backend === "cache" || result.reason === "cache_hit",
+    deliveryReady: Boolean(result.deliveryReady),
+    reason: result.reason ?? "",
+    userStatus: result.userStatus ?? null,
+  };
+}
+
+function pruneJobs() {
+  const now = Date.now();
+  const entries = [...jobStore.values()].sort(
+    (left, right) => Date.parse(left.updatedAt) - Date.parse(right.updatedAt),
+  );
+
+  for (const job of entries) {
+    if (
+      jobStore.size > MAX_STORED_JOBS ||
+      (job.status === "completed" || job.status === "failed") &&
+        now - Date.parse(job.updatedAt) > JOB_RETENTION_MS
+    ) {
+      jobStore.delete(job.id);
+    }
+  }
+}
+
 function buildToolResult(payload) {
   return {
     ok: payload.ok ?? true,
@@ -1058,6 +1429,10 @@ function mapErrorToReason(message) {
   if (/query or title is required/i.test(text)) return "missing_query";
   if (/requires selectionToken or query/i.test(text)) return "missing_selection_input";
   if (/invalid selectiontoken/i.test(text)) return "invalid_selection_token";
+  if (/jobId is required/i.test(text)) return "missing_job_id";
+  if (/Unknown jobId:/i.test(text)) return "unknown_job_id";
+  if (/remote queue is full/i.test(text)) return "remote_queue_full";
+  if (/remote queue wait aborted/i.test(text)) return "remote_queue_aborted";
   if (/cacheOnly=true prevented remote access/i.test(text)) return "cache_only_miss";
   if (/No matching search result found/i.test(text)) return "no_matching_search_result";
   if (/profile path does not exist/i.test(text)) return "profile_missing";

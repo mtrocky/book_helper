@@ -3,7 +3,11 @@ import { spawn } from "node:child_process";
 import { access, mkdir, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { debug, info } from "./debug.mjs";
-import { loadAgentBrowserSessionConfig } from "./playbooks.mjs";
+import {
+  DEFAULT_AGENT_BROWSER_SESSION_CONFIG_PATH,
+  DEFAULT_BROWSER_PROFILE_PATH,
+  loadAgentBrowserSessionConfig,
+} from "./playbooks.mjs";
 import {
   buildSafeFileName,
   estimateDownloadTimeoutMs,
@@ -1039,11 +1043,9 @@ function buildAgentBrowserError(message, options) {
   }
 
   const sessionName = options.sessionName || "clawbot";
-  const profilePath =
-    options.profilePath || path.join(process.cwd(), "Runtime", "profile");
+  const profilePath = options.profilePath || DEFAULT_BROWSER_PROFILE_PATH;
   const initUrl = options.initUrl || "about:blank";
-  const configPath =
-    options.sessionConfigPath || path.join(process.cwd(), "Runtime", "agent-browser-session.json");
+  const configPath = options.sessionConfigPath || DEFAULT_AGENT_BROWSER_SESSION_CONFIG_PATH;
 
   return new Error(
     [

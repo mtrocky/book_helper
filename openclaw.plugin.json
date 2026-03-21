@@ -1,11 +1,11 @@
 {
   "id": "library-fetcher",
   "name": "Library Fetcher",
-  "description": "OpenClaw book plugin with separate cache lookup, remote search, download, and login recovery flows backed by a persistent agent-browser profile.",
+  "description": "OpenClaw book plugin with separate cache lookup, remote search, queued download, and login recovery flows backed by a persistent browser profile.",
   "uiHints": {
     "playbooksDir": {
       "label": "Playbooks Dir",
-      "placeholder": "/Users/lgong/Documents/Workspace/ClawBot/playbooks",
+      "placeholder": "/absolute/path/to/library-fetcher/playbooks",
       "help": "Directory containing one playbook JSON per supported library site. Leave this set if you want siteId-based routing."
     },
     "defaultSiteId": {
@@ -15,32 +15,27 @@
     },
     "defaultPlaybookPath": {
       "label": "Default Playbook Path",
-      "placeholder": "/Users/lgong/Documents/Workspace/ClawBot/playbooks/c-library.json",
-      "help": "Recommended for this repo. Points OpenClaw directly at the single active site playbook."
+      "placeholder": "/absolute/path/to/library-fetcher/playbooks/c-library.json",
+      "help": "Recommended for the bundled c-library provider. Points OpenClaw directly at the active site playbook."
     },
     "defaultLibraryRoot": {
       "label": "Library Root",
-      "placeholder": "/Users/lgong/Documents/Workspace/ClawBot/library_root",
+      "placeholder": "~/.openclaw/plugins/library-fetcher/library",
       "help": "Local cache directory where downloaded books are stored. Keep this outside git-tracked content."
-    },
-    "agentWorkspaceRoot": {
-      "label": "Agent Workspace Root",
-      "placeholder": "/Users/lgong/openclaw/workspace",
-      "help": "OpenClaw agent workspace. Downloaded books are mirrored here so the final reply can send them as Feishu attachments."
     },
     "openclawMediaRoot": {
       "label": "OpenClaw Media Root",
-      "placeholder": "/Users/lgong/.openclaw/workspace",
+      "placeholder": "~/.openclaw/workspace",
       "help": "Preferred outbound media root. Files mirrored here are always under OpenClaw's allowed local media directories."
     },
     "browserProfilePath": {
       "label": "Browser Profile Path",
-      "placeholder": "/Users/lgong/Documents/Workspace/ClawBot/Runtime/profile",
+      "placeholder": "~/.openclaw/plugins/library-fetcher/profile",
       "help": "Persistent browser profile containing cookies and login state. Keep this directory and do not commit it."
     },
     "agentBrowserSessionConfigPath": {
       "label": "Session Config Path",
-      "placeholder": "/Users/lgong/Documents/Workspace/ClawBot/Runtime/agent-browser-session.json",
+      "placeholder": "~/.openclaw/plugins/library-fetcher/agent-browser-session.json",
       "help": "Recommended. JSON file containing the persistent sessionName/profilePath used by /bookfetch login and later headless runs."
     },
     "downloadTimeoutMs": {
@@ -48,10 +43,20 @@
       "placeholder": "15000",
       "help": "Optional timeout override for remote search and download steps. Keep this modest for debugging, raise it for large files."
     },
+    "remoteQueueConcurrency": {
+      "label": "Remote Queue Concurrency",
+      "placeholder": "1",
+      "help": "Maximum number of concurrent remote library tasks. Keep this low to avoid site throttling."
+    },
+    "remoteQueueMaxQueued": {
+      "label": "Remote Queue Max Queued",
+      "placeholder": "20",
+      "help": "Maximum number of waiting remote tasks before new requests are rejected."
+    },
     "agentBrowserPath": {
       "label": "agent-browser Path",
       "placeholder": "agent-browser",
-      "help": "Executable used for browser automation. Leave as agent-browser if it is already on PATH."
+      "help": "Executable used only for login/session recovery. Leave as agent-browser if it is already on PATH."
     },
     "llmFallbackCommand": {
       "label": "LLM Repair Command",
@@ -79,10 +84,6 @@
         "type": "string",
         "description": "Default local library cache directory."
       },
-      "agentWorkspaceRoot": {
-        "type": "string",
-        "description": "OpenClaw agent workspace used to create sendable attachment copies."
-      },
       "openclawMediaRoot": {
         "type": "string",
         "description": "OpenClaw local media root used for outbound attachments."
@@ -99,6 +100,16 @@
         "type": "integer",
         "minimum": 1000,
         "description": "Download timeout in milliseconds."
+      },
+      "remoteQueueConcurrency": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Maximum number of concurrent remote library tasks."
+      },
+      "remoteQueueMaxQueued": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Maximum number of waiting remote tasks before rejecting new ones."
       },
       "agentBrowserPath": {
         "type": "string",

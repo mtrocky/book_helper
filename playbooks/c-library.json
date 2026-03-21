@@ -3,12 +3,11 @@
   "name": "C-library Direct Download",
   "notes": [
     "This site can be queried directly through /s/<query> without first visiting the homepage.",
-    "The search result snapshot exposes a stable downloadable child ref under each 'Downloaded' result row, so this playbook extracts results from snapshot refs."
+    "The bundled Playwright provider reads real search-card attributes and download links directly from the DOM."
   ],
   "browser": {
     "headed": false,
     "sessionName": "clawbot",
-    "profilePath": "/Users/lgong/Documents/Workspace/ClawBot/Runtime/profile",
     "requireAuthenticatedProfile": true
   },
   "llmFallback": {

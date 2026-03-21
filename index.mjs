@@ -6,11 +6,17 @@ import {
   DOWNLOAD_TOOL_NAME,
   downloadBookToLibrary,
   getStatusSnapshot,
+  getLibraryJobResult,
+  getLibraryJobStatus,
+  JOB_RESULT_TOOL_NAME,
+  JOB_STATUS_TOOL_NAME,
+  JOB_SUBMIT_TOOL_NAME,
   lookupCachedBook,
   PLUGIN_ID,
   resetLibraryCache,
   SEARCH_TOOL_NAME,
   searchBooks,
+  submitLibraryJob,
   startLibraryLogin,
   TOOL_GROUP,
   describeStatus,
@@ -41,6 +47,9 @@ function resolveToolPolicySource(config) {
     if (list.includes(CACHE_LOOKUP_TOOL_NAME)) return `${path} (${CACHE_LOOKUP_TOOL_NAME})`;
     if (list.includes(SEARCH_TOOL_NAME)) return `${path} (${SEARCH_TOOL_NAME})`;
     if (list.includes(DOWNLOAD_TOOL_NAME)) return `${path} (${DOWNLOAD_TOOL_NAME})`;
+    if (list.includes(JOB_SUBMIT_TOOL_NAME)) return `${path} (${JOB_SUBMIT_TOOL_NAME})`;
+    if (list.includes(JOB_STATUS_TOOL_NAME)) return `${path} (${JOB_STATUS_TOOL_NAME})`;
+    if (list.includes(JOB_RESULT_TOOL_NAME)) return `${path} (${JOB_RESULT_TOOL_NAME})`;
     if (list.includes(PLUGIN_ID)) return `${path} (${PLUGIN_ID})`;
     if (list.includes(TOOL_GROUP)) return `${path} (${TOOL_GROUP})`;
   }
@@ -397,6 +406,144 @@ const libraryFetcherPlugin = {
         const result = await executeToolSafely(
           () => downloadBookToLibrary(params, api.pluginConfig, signal),
           { backend: "agent-browser" },
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      },
+    });
+
+    api.registerTool({
+      name: JOB_SUBMIT_TOOL_NAME,
+      label: "Library Job Submit",
+      description:
+        "Submit a full fetch job that may queue behind other users. Returns a jobId and initial queue position immediately.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "The main user-provided book name or search phrase.",
+          },
+          title: {
+            type: "string",
+            description: "Optional explicit book title. If query is omitted, title is used as the query.",
+          },
+          titleHint: {
+            type: "string",
+            description: "Optional exact title override. When omitted, the tool uses query as the title hint.",
+          },
+          author: {
+            type: "string",
+            description: "Optional explicit author name. Maps to authorHint when authorHint is omitted.",
+          },
+          authorHint: {
+            type: "string",
+            description: "Optional author hint for better result ranking.",
+          },
+          language: {
+            type: "string",
+            description: "Optional explicit language. Maps to languageHint when languageHint is omitted.",
+          },
+          languageHint: {
+            type: "string",
+            description: "Optional language hint used to prefer matching language variants.",
+          },
+          siteId: {
+            type: "string",
+            description: "Site playbook id resolved against playbooksDir. Falls back to plugin config when omitted.",
+          },
+          playbookPath: {
+            type: "string",
+            description: "Absolute path to a site playbook JSON. Overrides siteId when provided.",
+          },
+          libraryRoot: {
+            type: "string",
+            description: "Absolute path to the local book cache directory. Falls back to plugin config when omitted.",
+          },
+          forceRefresh: {
+            type: "boolean",
+            description: "Skip the local cache and force a new remote fetch.",
+          },
+          timeoutMs: {
+            type: "integer",
+            minimum: 1000,
+            description: "Optional timeout override in milliseconds.",
+          },
+        },
+        anyOf: [{ required: ["query"] }, { required: ["title"] }],
+      },
+      execute: async (_toolCallId, params) => {
+        const result = await executeToolSafely(
+          () => submitLibraryJob(params, api.pluginConfig),
+          { backend: "job-submit" },
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      },
+    });
+
+    api.registerTool({
+      name: JOB_STATUS_TOOL_NAME,
+      label: "Library Job Status",
+      description:
+        "Check the current status of a previously submitted fetch job, including live queue position when still waiting.",
+      parameters: {
+        type: "object",
+        properties: {
+          jobId: {
+            type: "string",
+            description: "Job id returned by library_job_submit.",
+          },
+        },
+        required: ["jobId"],
+      },
+      execute: async (_toolCallId, params) => {
+        const result = await executeToolSafely(
+          () => getLibraryJobStatus(params, api.pluginConfig),
+          { backend: "job-status" },
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      },
+    });
+
+    api.registerTool({
+      name: JOB_RESULT_TOOL_NAME,
+      label: "Library Job Result",
+      description:
+        "Return the final result of a completed fetch job, including replyMediaToken for attachment delivery when ready.",
+      parameters: {
+        type: "object",
+        properties: {
+          jobId: {
+            type: "string",
+            description: "Job id returned by library_job_submit.",
+          },
+        },
+        required: ["jobId"],
+      },
+      execute: async (_toolCallId, params) => {
+        const result = await executeToolSafely(
+          () => getLibraryJobResult(params, api.pluginConfig),
+          { backend: "job-result" },
         );
         return {
           content: [

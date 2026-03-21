@@ -89,6 +89,21 @@ export async function openCacheStore({ libraryRoot }) {
       estimateDownloadWindow({ playbookId, backend, expectedBytes }) {
         return estimateDownloadWindowSync(db, { playbookId, backend, expectedBytes });
       },
+      upsertJob(job) {
+        upsertJobSync(db, job);
+      },
+      getJob(jobId) {
+        return loadJobSync(db, jobId);
+      },
+      getJobCounts() {
+        return getJobCountsSync(db);
+      },
+      pruneJobs({ maxStored = 200, retentionMs = 24 * 60 * 60 * 1000 } = {}) {
+        return pruneJobsSync(db, { maxStored, retentionMs });
+      },
+      recoverInterruptedJobs() {
+        return recoverInterruptedJobsSync(db);
+      },
       clearAll() {
         clearAllEntriesSync(db);
       },
@@ -143,6 +158,21 @@ function ensureSchema(db) {
       predicted_timeout_ms INTEGER,
       duration_seconds REAL NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS jobs (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL DEFAULT 'fetch',
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      params_json TEXT NOT NULL DEFAULT '{}',
+      queue_task_id TEXT NOT NULL DEFAULT '',
+      queue_kind TEXT NOT NULL DEFAULT '',
+      queue_initial_position INTEGER NOT NULL DEFAULT 0,
+      queue_tasks_ahead_at_enqueue INTEGER NOT NULL DEFAULT 0,
+      result_json TEXT NOT NULL DEFAULT '',
+      error_json TEXT NOT NULL DEFAULT ''
+    );
   `);
 
   ensureTableColumn(db, "cache_entries", "language", "TEXT NOT NULL DEFAULT ''");
@@ -172,6 +202,8 @@ function ensureSchema(db) {
 
     CREATE INDEX IF NOT EXISTS idx_download_history_playbook_backend_recorded_at
       ON download_history(playbook_id, backend, recorded_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_jobs_status_updated_at
+      ON jobs(status, updated_at DESC);
   `);
 }
 
@@ -449,6 +481,7 @@ function removeEntryIdsSync(db, ids) {
 
 function clearAllEntriesSync(db) {
   withTransaction(db, () => {
+    db.exec("DELETE FROM jobs;");
     db.exec("DELETE FROM download_history;");
     db.exec("DELETE FROM cache_aliases;");
     db.exec("DELETE FROM cache_entries;");
@@ -470,6 +503,121 @@ function insertDownloadHistorySync(db, sample) {
       @expectedBytes, @predictedSeconds, @predictedTimeoutMs, @durationSeconds
     )
   `).run(normalized);
+}
+
+function upsertJobSync(db, job) {
+  const normalized = normalizeJob(job);
+  db.prepare(`
+    INSERT INTO jobs (
+      id, kind, status, created_at, updated_at, params_json,
+      queue_task_id, queue_kind, queue_initial_position, queue_tasks_ahead_at_enqueue,
+      result_json, error_json
+    ) VALUES (
+      @id, @kind, @status, @createdAt, @updatedAt, @paramsJson,
+      @queueTaskId, @queueKind, @queueInitialPosition, @queueTasksAheadAtEnqueue,
+      @resultJson, @errorJson
+    )
+    ON CONFLICT(id) DO UPDATE SET
+      kind = excluded.kind,
+      status = excluded.status,
+      created_at = excluded.created_at,
+      updated_at = excluded.updated_at,
+      params_json = excluded.params_json,
+      queue_task_id = excluded.queue_task_id,
+      queue_kind = excluded.queue_kind,
+      queue_initial_position = excluded.queue_initial_position,
+      queue_tasks_ahead_at_enqueue = excluded.queue_tasks_ahead_at_enqueue,
+      result_json = excluded.result_json,
+      error_json = excluded.error_json
+  `).run(normalized);
+}
+
+function loadJobSync(db, jobId) {
+  const row = db.prepare(`
+    SELECT *
+    FROM jobs
+    WHERE id = ?
+    LIMIT 1
+  `).get(String(jobId ?? "").trim());
+  return row ? deserializeJob(row) : null;
+}
+
+function getJobCountsSync(db) {
+  const rows = db.prepare(`
+    SELECT status, COUNT(*) AS count
+    FROM jobs
+    GROUP BY status
+  `).all();
+  const counts = {
+    total: 0,
+    queued: 0,
+    running: 0,
+    completed: 0,
+    failed: 0,
+    submitted: 0,
+  };
+  for (const row of rows) {
+    const status = String(row.status ?? "");
+    const count = Number(row.count ?? 0);
+    counts.total += count;
+    if (status in counts) {
+      counts[status] = count;
+    }
+  }
+  return counts;
+}
+
+function pruneJobsSync(db, { maxStored, retentionMs }) {
+  const max = Number.isInteger(maxStored) && maxStored > 0 ? maxStored : 200;
+  const keepSince = new Date(Date.now() - Math.max(0, Number(retentionMs) || 0)).toISOString();
+  const removable = db.prepare(`
+    SELECT id
+    FROM jobs
+    WHERE status IN ('completed', 'failed') AND updated_at < ?
+    ORDER BY updated_at ASC
+  `).all(keepSince);
+
+  withTransaction(db, () => {
+    const removeStmt = db.prepare("DELETE FROM jobs WHERE id = ?");
+    for (const row of removable) {
+      removeStmt.run(row.id);
+    }
+
+    const total = Number(db.prepare("SELECT COUNT(*) AS count FROM jobs").get().count ?? 0);
+    const overflow = Math.max(0, total - max);
+    if (overflow > 0) {
+      const extraRows = db.prepare(`
+        SELECT id
+        FROM jobs
+        WHERE status IN ('completed', 'failed')
+        ORDER BY updated_at ASC
+        LIMIT ?
+      `).all(overflow);
+      for (const row of extraRows) {
+        removeStmt.run(row.id);
+      }
+    }
+  });
+}
+
+function recoverInterruptedJobsSync(db) {
+  const now = new Date().toISOString();
+  const errorPayload = JSON.stringify({
+    ok: false,
+    found: false,
+    reason: "job_interrupted",
+    errorMessage: "The OpenClaw runtime restarted before this job completed.",
+  });
+  const result = db.prepare(`
+    UPDATE jobs
+    SET status = 'failed',
+        updated_at = ?,
+        error_json = ?,
+        queue_task_id = '',
+        queue_kind = ''
+    WHERE status IN ('submitted', 'queued', 'running')
+  `).run(now, errorPayload);
+  return Number(result.changes ?? 0);
 }
 
 function estimateDownloadWindowSync(db, { playbookId, backend, expectedBytes }) {
@@ -555,6 +703,46 @@ function normalizeDownloadSample(sample) {
         ? Math.round(Number(sample.predictedTimeoutMs))
         : null,
     durationSeconds,
+  };
+}
+
+function normalizeJob(job) {
+  return {
+    id: String(job?.id ?? "").trim(),
+    kind: String(job?.kind ?? "fetch").trim() || "fetch",
+    status: String(job?.status ?? "submitted").trim() || "submitted",
+    createdAt: String(job?.createdAt ?? new Date().toISOString()),
+    updatedAt: String(job?.updatedAt ?? new Date().toISOString()),
+    paramsJson: safeJson(job?.params ?? {}),
+    queueTaskId: String(job?.queueTaskId ?? "").trim(),
+    queueKind: String(job?.queueKind ?? "").trim(),
+    queueInitialPosition:
+      Number.isInteger(job?.queueInitialPosition) && job.queueInitialPosition >= 0
+        ? job.queueInitialPosition
+        : 0,
+    queueTasksAheadAtEnqueue:
+      Number.isInteger(job?.queueTasksAheadAtEnqueue) && job.queueTasksAheadAtEnqueue >= 0
+        ? job.queueTasksAheadAtEnqueue
+        : 0,
+    resultJson: job?.result ? safeJson(job.result) : "",
+    errorJson: job?.error ? safeJson(job.error) : "",
+  };
+}
+
+function deserializeJob(row) {
+  return {
+    id: String(row.id ?? ""),
+    kind: String(row.kind ?? "fetch"),
+    status: String(row.status ?? "submitted"),
+    createdAt: String(row.created_at ?? ""),
+    updatedAt: String(row.updated_at ?? ""),
+    params: parseJsonObject(row.params_json, {}),
+    queueTaskId: String(row.queue_task_id ?? ""),
+    queueKind: String(row.queue_kind ?? ""),
+    queueInitialPosition: Number(row.queue_initial_position ?? 0) || 0,
+    queueTasksAheadAtEnqueue: Number(row.queue_tasks_ahead_at_enqueue ?? 0) || 0,
+    result: parseJsonObject(row.result_json, null),
+    error: parseJsonObject(row.error_json, null),
   };
 }
 
@@ -756,6 +944,25 @@ function roundNumber(value, digits) {
 
 function cryptoRandomId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function safeJson(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "{}";
+  }
+}
+
+function parseJsonObject(raw, fallback) {
+  if (typeof raw !== "string" || !raw.trim()) {
+    return fallback;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
 }
 
 function ensureTableColumn(db, tableName, columnName, columnSpec) {

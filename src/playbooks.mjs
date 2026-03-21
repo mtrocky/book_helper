@@ -1,5 +1,7 @@
+import os from "node:os";
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { debug } from "./debug.mjs";
 
 const STEP_TYPES = new Set([
@@ -16,9 +18,20 @@ const STEP_TYPES = new Set([
   "download",
 ]);
 
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PLUGIN_ROOT = path.resolve(MODULE_DIR, "..");
+
+export const DEFAULT_PLUGIN_STATE_ROOT = path.join(
+  os.homedir(),
+  ".openclaw",
+  "plugins",
+  "library-fetcher",
+);
+export const DEFAULT_PLAYBOOKS_DIR = path.join(PLUGIN_ROOT, "playbooks");
+export const DEFAULT_LIBRARY_ROOT = path.join(DEFAULT_PLUGIN_STATE_ROOT, "library");
+export const DEFAULT_BROWSER_PROFILE_PATH = path.join(DEFAULT_PLUGIN_STATE_ROOT, "profile");
 export const DEFAULT_AGENT_BROWSER_SESSION_CONFIG_PATH = path.join(
-  process.cwd(),
-  "Runtime",
+  DEFAULT_PLUGIN_STATE_ROOT,
   "agent-browser-session.json",
 );
 
@@ -31,8 +44,6 @@ export function parsePluginConfig(value) {
   return {
     defaultLibraryRoot:
       typeof config.defaultLibraryRoot === "string" ? config.defaultLibraryRoot : undefined,
-    agentWorkspaceRoot:
-      typeof config.agentWorkspaceRoot === "string" ? config.agentWorkspaceRoot : undefined,
     openclawMediaRoot:
       typeof config.openclawMediaRoot === "string" ? config.openclawMediaRoot : undefined,
     playbooksDir: typeof config.playbooksDir === "string" ? config.playbooksDir : undefined,
@@ -51,6 +62,14 @@ export function parsePluginConfig(value) {
       Number.isInteger(config.downloadTimeoutMs) && config.downloadTimeoutMs > 0
         ? config.downloadTimeoutMs
         : undefined,
+    remoteQueueConcurrency:
+      Number.isInteger(config.remoteQueueConcurrency) && config.remoteQueueConcurrency > 0
+        ? config.remoteQueueConcurrency
+        : undefined,
+    remoteQueueMaxQueued:
+      Number.isInteger(config.remoteQueueMaxQueued) && config.remoteQueueMaxQueued >= 0
+        ? config.remoteQueueMaxQueued
+        : undefined,
     llmFallbackCommand:
       typeof config.llmFallbackCommand === "string" ? config.llmFallbackCommand : undefined,
     llmFallbackArgs: Array.isArray(config.llmFallbackArgs)
@@ -61,7 +80,7 @@ export function parsePluginConfig(value) {
 
 export async function getStatusSnapshot(pluginConfig, toolPolicySource = null) {
   const config = parsePluginConfig(pluginConfig);
-  const playbooksDir = path.resolve(config.playbooksDir ?? path.join(process.cwd(), "playbooks"));
+  const playbooksDir = path.resolve(config.playbooksDir ?? DEFAULT_PLAYBOOKS_DIR);
   const defaultPlaybookPath = config.defaultPlaybookPath
     ? path.resolve(config.defaultPlaybookPath)
     : config.defaultSiteId
@@ -69,12 +88,9 @@ export async function getStatusSnapshot(pluginConfig, toolPolicySource = null) {
     : "(unset)";
   const playbookExists =
     defaultPlaybookPath !== "(unset)" && (await exists(defaultPlaybookPath)) ? "present" : "missing";
-  const libraryRoot = config.defaultLibraryRoot ?? "(unset)";
+  const libraryRoot = config.defaultLibraryRoot ?? DEFAULT_LIBRARY_ROOT;
   const libraryExists =
-    libraryRoot !== "(unset)" && (await exists(libraryRoot)) ? "present" : "missing";
-  const agentWorkspaceRoot = config.agentWorkspaceRoot ?? "(unset)";
-  const agentWorkspacePresent =
-    agentWorkspaceRoot !== "(unset)" && (await exists(agentWorkspaceRoot)) ? "present" : "missing";
+    libraryRoot && (await exists(libraryRoot)) ? "present" : "missing";
   const openclawMediaRoot = config.openclawMediaRoot ?? "(unset)";
   const openclawMediaPresent =
     openclawMediaRoot !== "(unset)" && (await exists(openclawMediaRoot)) ? "present" : "missing";
@@ -91,14 +107,15 @@ export async function getStatusSnapshot(pluginConfig, toolPolicySource = null) {
         config: {},
       };
   const sessionName = sessionRuntime.config.sessionName ?? "(unset)";
-  const profilePath = sessionRuntime.config.profilePath ?? config.browserProfilePath ?? "(unset)";
-  const profileExists = profilePath !== "(unset)" && (await exists(profilePath)) ? "present" : "missing";
+  const profilePath =
+    sessionRuntime.config.profilePath ?? config.browserProfilePath ?? DEFAULT_BROWSER_PROFILE_PATH;
+  const profileExists = profilePath && (await exists(profilePath)) ? "present" : "missing";
 
   return {
     ok: true,
     found: true,
     reason: "status_snapshot",
-    executionModel: "agent-browser playbook with optional LLM repair fallback",
+    executionModel: "Playwright-first library fetcher with optional agent-browser login recovery",
     toolPolicySource: toolPolicySource ?? "(not enabled)",
     playbooksDir,
     defaultSiteId: config.defaultSiteId ?? "",
@@ -106,8 +123,6 @@ export async function getStatusSnapshot(pluginConfig, toolPolicySource = null) {
     defaultPlaybookPresent: playbookExists === "present",
     defaultLibraryRoot: libraryRoot,
     defaultLibraryRootPresent: libraryExists === "present",
-    agentWorkspaceRoot,
-    agentWorkspacePresent: agentWorkspacePresent === "present",
     openclawMediaRoot,
     openclawMediaPresent: openclawMediaPresent === "present",
     sessionConfigPath,
@@ -131,7 +146,6 @@ export async function describeStatus(pluginConfig, toolPolicySource = null) {
     `- default site id: ${snapshot.defaultSiteId || "(unset)"}`,
     `- default playbook: ${snapshot.defaultPlaybookPath} [${snapshot.defaultPlaybookPresent ? "present" : "missing"}]`,
     `- default library root: ${snapshot.defaultLibraryRoot} [${snapshot.defaultLibraryRootPresent ? "present" : "missing"}]`,
-    `- agent workspace root: ${snapshot.agentWorkspaceRoot} [${snapshot.agentWorkspacePresent ? "present" : "missing"}]`,
     `- OpenClaw media root: ${snapshot.openclawMediaRoot} [${snapshot.openclawMediaPresent ? "present" : "missing"}]`,
     `- agent-browser session config: ${snapshot.sessionConfigPath} [${snapshot.sessionConfigPresent ? "present" : "missing"}]`,
     `- agent-browser session name: ${snapshot.sessionName}`,
@@ -139,9 +153,10 @@ export async function describeStatus(pluginConfig, toolPolicySource = null) {
     `- agent-browser executable: ${snapshot.agentBrowserPath}`,
     `- LLM fallback command: ${snapshot.llmFallbackCommand || "(unset)"}`,
     "",
-    "Playbook model:",
+    "Provider model:",
     "- each supported site lives in its own JSON playbook",
-    "- playbook steps run deterministically through agent-browser",
+    "- Playwright is the preferred search/download runtime when a provider supports it",
+    "- agent-browser is retained for login/session recovery and provider fallback paths",
     "- LLM fallback only runs when a step fails or a result is ambiguous",
     "",
     "Commands:",
@@ -248,7 +263,7 @@ function resolvePlaybookPath({ siteId, playbookPath, pluginConfig }) {
     return null;
   }
 
-  const playbooksDir = path.resolve(pluginConfig.playbooksDir ?? path.join(process.cwd(), "playbooks"));
+  const playbooksDir = path.resolve(pluginConfig.playbooksDir ?? DEFAULT_PLAYBOOKS_DIR);
   return path.join(playbooksDir, `${resolvedSiteId}.json`);
 }
 
